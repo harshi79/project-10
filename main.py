@@ -55,9 +55,14 @@ queue_lock = threading.Lock()
 
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        if self.path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK - Yori Bot is alive")
+        else:
+            self.send_response(404)
+            self.end_headers()
     def log_message(self, *a): pass
 
 def _start_health():
@@ -325,35 +330,54 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True, is_persistent=True,
 )
 
-def type_ikb(cards: list, combos: list, phones: list, uid: int, fmt: str = "txt") -> InlineKeyboardMarkup:
-    """Inline buttons for type selection + format + domain"""
+def type_ikb(cards: list, combos: list, phones: list, uid: int, fmt: str = "txt",
+             selected_types: set | None = None, domain: str | None = None,
+             sort: bool = False) -> InlineKeyboardMarkup:
+    """Inline keyboard: select format, select types, pick domains, then generate"""
     rows = []
-    # Type filter buttons
+    sel = selected_types or set()
+
+    # Row 1: Format buttons
+    rows.append([
+        InlineKeyboardButton(f"📄 TXT {'✅' if fmt == 'txt' else ''}", callback_data=f"fmt:txt:{uid}"),
+        InlineKeyboardButton(f"📊 CSV {'✅' if fmt == 'csv' else ''}", callback_data=f"fmt:csv:{uid}"),
+        InlineKeyboardButton(f"📈 Excel {'✅' if fmt == 'xlsx' else ''}", callback_data=f"fmt:xlsx:{uid}"),
+    ])
+
+    # Row 2: Type selection (checkbox style)
     type_row = []
     if cards:
-        type_row.append(InlineKeyboardButton(f"💳 Cards ({len(cards)})", callback_data=f"type:cards:{fmt}:{uid}"))
+        type_row.append(InlineKeyboardButton(
+            f"💳 Cards {'✅' if 'cards' in sel else ''}",
+            callback_data=f"sel:cards:{uid}"))
     if combos:
-        type_row.append(InlineKeyboardButton(f"🔑 Emails ({len(combos)})", callback_data=f"type:combos:{fmt}:{uid}"))
+        type_row.append(InlineKeyboardButton(
+            f"🔑 Emails {'✅' if 'combos' in sel else ''}",
+            callback_data=f"sel:combos:{uid}"))
     if phones:
-        type_row.append(InlineKeyboardButton(f"📱 Phones ({len(phones)})", callback_data=f"type:phones:{fmt}:{uid}"))
+        type_row.append(InlineKeyboardButton(
+            f"📱 Phones {'✅' if 'phones' in sel else ''}",
+            callback_data=f"sel:phones:{uid}"))
     if len(type_row) > 1:
-        type_row.append(InlineKeyboardButton("🔀 All", callback_data=f"type:all:{fmt}:{uid}"))
+        type_row.append(InlineKeyboardButton(
+            f"🔀 All {'✅' if not sel else ''}",
+            callback_data=f"sel:all:{uid}"))
     rows.append(type_row)
-
-    # Format buttons
-    rows.append([
-        InlineKeyboardButton("📄 TXT", callback_data=f"fmt:txt:{uid}"),
-        InlineKeyboardButton("📊 CSV", callback_data=f"fmt:csv:{uid}"),
-        InlineKeyboardButton("📈 Excel", callback_data=f"fmt:xlsx:{uid}"),
-    ])
 
     # Domain buttons (if combos exist)
     if combos:
-        domains = get_domains(combos)[:5]  # top 5 domains
+        domains = get_domains(combos)[:5]
         if domains:
-            domain_row = [InlineKeyboardButton(f"📧 {d}", callback_data=f"domain:{d}:{fmt}:{uid}") for d in domains]
+            domain_row = [InlineKeyboardButton(
+                f"📧 {d} {'✅' if domain == d else ''}",
+                callback_data=f"seld:{d}:{uid}") for d in domains]
             rows.append(domain_row)
-        rows.append([InlineKeyboardButton("🔤 Sort by domain", callback_data=f"sort:domain:{fmt}:{uid}")])
+        rows.append([InlineKeyboardButton(
+            f"🔤 Sort by domain {'✅' if sort else ''}",
+            callback_data=f"sels:domain:{uid}")])
+
+    # Generate button at bottom
+    rows.append([InlineKeyboardButton("🚀 GENERATE", callback_data=f"gen:{fmt}:{uid}")])
 
     return InlineKeyboardMarkup(rows)
 
@@ -555,6 +579,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         base = doc.file_name.rsplit(".txt", 1)[0].rsplit(".TXT", 1)[0]
 
         # Add to queue
+        full_name = " ".join(filter(None, [user.first_name, user.last_name]))
+        uname = f"@{user.username}" if user.username else "—"
         with queue_lock:
             queue_item = {
                 "uid": uid,
@@ -571,6 +597,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 "selected_domain": None,
                 "sort_by_domain": False,
                 "status": "analysed",
+                "user_name": full_name,
+                "user_username": uname,
             }
             file_queue.append(queue_item)
             log_queue(uid, doc.file_name, "queued")
@@ -606,19 +634,21 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode="HTML", reply_markup=MAIN_KB,
         )
 
-async def process_queue_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -> None:
+async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -> None:
     """Process a queued item and send output"""
     uid = queue_item["uid"]
     cards = queue_item["cards"]
     combos = queue_item["combos"]
     phones = queue_item["phones"]
     base = queue_item["base"]
-    fmt = queue_item["selected_format"]
-    selected_types = queue_item["selected_types"]
-    domain = queue_item["selected_domain"]
-    sort_by_domain = queue_item["sort_by_domain"]
+    fmt = queue_item.get("selected_format", "txt")
+    selected_types = queue_item.get("selected_types", set())
+    domain = queue_item.get("selected_domain", None)
+    sort_by_domain = queue_item.get("sort_by_domain", False)
+    user_name = queue_item.get("user_name", "")
+    user_username = queue_item.get("user_username", "")
 
-    # Apply filters
+    # Apply type filters
     out_cards = cards if (not selected_types or "cards" in selected_types) else []
     out_combos = combos if (not selected_types or "combos" in selected_types) else []
     out_phones = phones if (not selected_types or "phones" in selected_types) else []
@@ -631,19 +661,24 @@ async def process_queue_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE, que
     if sort_by_domain and out_combos:
         out_combos = sort_combos_by_domain(out_combos)
 
+    if not out_cards and not out_combos and not out_phones:
+        await ctx.bot.send_message(
+            uid,
+            "⚠️ <b>No data left after filtering.</b>\nTry selecting a different type or domain.",
+            parse_mode="HTML",
+        )
+        return
+
     # Build output
     if fmt == "csv":
         output = build_csv(out_cards, out_combos, out_phones)
         ext = "csv"
-        mime = "text/csv"
     elif fmt == "xlsx":
         output_bytes = build_xlsx(out_cards, out_combos, out_phones)
         ext = "xlsx"
-        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     else:
         output = build_txt(out_cards, out_combos, out_phones)
         ext = "txt"
-        mime = "text/plain"
 
     # Create buffer
     if fmt == "xlsx":
@@ -651,11 +686,6 @@ async def process_queue_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE, que
     else:
         buf = BytesIO(output.encode("utf-8"))
     buf.name = f"{base}_cleaned.{ext}"
-
-    # Stats
-    full_name = " ".join(filter(None, [ctx.bot.get_chat(uid).result.first_name if hasattr(ctx.bot.get_chat(uid), 'result') else "", ""]))
-    # Actually, we can't easily get name here, just use what we have
-    # The user was already recorded when file was uploaded
 
     # Caption
     parts = []
@@ -674,8 +704,8 @@ async def process_queue_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE, que
     caption = (
         f"✅ <b>Done!</b>\n"
         f"──────────────────\n"
-        f"\n".join(parts) + "\n\n"
-        f"<i>— @yorifederation</i>"
+        + "\n".join(parts) + "\n\n"
+        + "<i>— @yorifederation</i>"
     )
 
     try:
@@ -689,12 +719,7 @@ async def process_queue_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE, que
         )
 
         # Update stats
-        user = await ctx.bot.get_chat(uid)
-        uname = f"@{user.username}" if user.username else "—"
-        full_name = user.first_name or ""
-        if user.last_name:
-            full_name += f" {user.last_name}"
-        upsert_user(uid, full_name, uname, len(out_cards), len(out_combos) + len(out_phones))
+        upsert_user(uid, user_name, user_username, len(out_cards), len(out_combos) + len(out_phones))
 
         log_queue(uid, queue_item["filename"], "done")
         log.info("Processed %s for uid=%s cards=%d combos=%d phones=%d fmt=%s",
@@ -703,6 +728,16 @@ async def process_queue_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE, que
     except Exception as e:
         log.error("Error sending file to uid=%s: %s", uid, e)
         log_queue(uid, queue_item["filename"], "error")
+        await ctx.bot.send_message(
+            uid,
+            "❌ <b>Failed to send file.</b> Please try again.",
+            parse_mode="HTML",
+        )
+
+def _get_user_queue_item(uid: int):
+    with queue_lock:
+        user_items = [q for q in file_queue if q["uid"] == uid and q["status"] == "analysed"]
+        return user_items[-1] if user_items else None
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -726,90 +761,110 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await query.message.reply_text(global_stats_text(), parse_mode="HTML")
 
-    elif data.startswith("type:"):
-        # type:TYPE:FMT:UID
-        parts = data.split(":")
-        if len(parts) >= 4:
-            type_name = parts[1]
-            fmt = parts[2]
-            # Find user's latest queue item
-            with queue_lock:
-                user_items = [q for q in file_queue if q["uid"] == uid and q["status"] == "analysed"]
-                if not user_items:
-                    await query.message.reply_text("⏳ No pending file found. Send a new file.")
-                    return
-                item = user_items[-1]  # latest
-
-                if type_name == "all":
-                    item["selected_types"] = set()
-                else:
-                    item["selected_types"].add(type_name)
-                item["selected_format"] = fmt
-                item["status"] = "processing"
-
-            # Process and send
-            await process_queue_item(update, ctx, item)
-
-            # Remove from queue
-            with queue_lock:
-                if item in file_queue:
-                    file_queue.remove(item)
-
     elif data.startswith("fmt:"):
         # fmt:FMT:UID
         parts = data.split(":")
         if len(parts) >= 3:
             fmt = parts[1]
-            with queue_lock:
-                user_items = [q for q in file_queue if q["uid"] == uid and q["status"] == "analysed"]
-                if not user_items:
-                    await query.message.reply_text("⏳ No pending file found. Send a new file.")
-                    return
-                item = user_items[-1]
-                item["selected_format"] = fmt
-                # Update keyboard to show selected format
+            item = _get_user_queue_item(uid)
+            if not item:
+                await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+                return
+            item["selected_format"] = fmt
+            try:
                 await query.message.edit_reply_markup(
-                    reply_markup=type_ikb(item["cards"], item["combos"], item["phones"], uid, fmt)
+                    reply_markup=type_ikb(
+                        item["cards"], item["combos"], item["phones"], uid, fmt,
+                        item["selected_types"], item["selected_domain"], item["sort_by_domain"]
+                    )
                 )
+            except BadRequest:
+                pass
+            await query.answer(f"✅ Format: {fmt.upper()}")
 
-    elif data.startswith("domain:"):
-        # domain:DOMAIN:FMT:UID
+    elif data.startswith("sel:"):
+        # sel:TYPE:UID  — toggle type checkbox
         parts = data.split(":")
-        if len(parts) >= 4:
+        if len(parts) >= 3:
+            type_name = parts[1]
+            item = _get_user_queue_item(uid)
+            if not item:
+                await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+                return
+
+            if type_name == "all":
+                item["selected_types"] = set()
+            elif type_name in item["selected_types"]:
+                item["selected_types"].discard(type_name)
+            else:
+                item["selected_types"].add(type_name)
+
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=type_ikb(
+                        item["cards"], item["combos"], item["phones"], uid,
+                        item["selected_format"], item["selected_types"],
+                        item["selected_domain"], item["sort_by_domain"]
+                    )
+                )
+            except BadRequest:
+                pass
+            await query.answer(f"✅ Types: {', '.join(item['selected_types']) or 'All'}")
+
+    elif data.startswith("seld:"):
+        # seld:DOMAIN:UID — select domain
+        parts = data.split(":")
+        if len(parts) >= 3:
             domain = parts[1]
-            fmt = parts[2]
-            with queue_lock:
-                user_items = [q for q in file_queue if q["uid"] == uid and q["status"] == "analysed"]
-                if not user_items:
-                    await query.message.reply_text("⏳ No pending file found. Send a new file.")
-                    return
-                item = user_items[-1]
-                item["selected_domain"] = domain
-                item["selected_format"] = fmt
-                item["status"] = "processing"
+            item = _get_user_queue_item(uid)
+            if not item:
+                await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+                return
+            item["selected_domain"] = domain if item.get("selected_domain") != domain else None
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=type_ikb(
+                        item["cards"], item["combos"], item["phones"], uid,
+                        item["selected_format"], item["selected_types"],
+                        item["selected_domain"], item["sort_by_domain"]
+                    )
+                )
+            except BadRequest:
+                pass
+            await query.answer(f"✅ Domain: {item['selected_domain'] or 'All'}")
 
-            await process_queue_item(update, ctx, item)
-
-            with queue_lock:
-                if item in file_queue:
-                    file_queue.remove(item)
-
-    elif data.startswith("sort:domain:"):
-        # sort:domain:FMT:UID
+    elif data.startswith("sels:domain:"):
+        # sels:domain:UID — toggle sort by domain
         parts = data.split(":")
-        if len(parts) >= 4:
-            fmt = parts[2]
-            with queue_lock:
-                user_items = [q for q in file_queue if q["uid"] == uid and q["status"] == "analysed"]
-                if not user_items:
-                    await query.message.reply_text("⏳ No pending file found. Send a new file.")
-                    return
-                item = user_items[-1]
-                item["sort_by_domain"] = True
-                item["selected_format"] = fmt
-                item["status"] = "processing"
+        if len(parts) >= 3:
+            item = _get_user_queue_item(uid)
+            if not item:
+                await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+                return
+            item["sort_by_domain"] = not item.get("sort_by_domain", False)
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=type_ikb(
+                        item["cards"], item["combos"], item["phones"], uid,
+                        item["selected_format"], item["selected_types"],
+                        item["selected_domain"], item["sort_by_domain"]
+                    )
+                )
+            except BadRequest:
+                pass
+            await query.answer(f"✅ Sort: {'ON' if item['sort_by_domain'] else 'OFF'}")
 
-            await process_queue_item(update, ctx, item)
+    elif data.startswith("gen:"):
+        # gen:FMT:UID — generate output
+        parts = data.split(":")
+        if len(parts) >= 3:
+            item = _get_user_queue_item(uid)
+            if not item:
+                await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+                return
+
+            item["status"] = "processing"
+            await process_queue_item(ctx, item)
 
             with queue_lock:
                 if item in file_queue:
