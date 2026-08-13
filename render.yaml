@@ -1,0 +1,20 @@
+# Render Blueprint — one-click deploy
+#  1. Push this repo to GitHub
+#  2. On Render: Dashboard → New + → "Blueprint"
+#  3. Pick the repo; Render reads this file and creates the service.
+#  4. Set the TELEGRAM_BOT_TOKEN env var on the dashboard (left blank below).
+
+services:
+  - type: web
+    name: yori-prime-bot
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    # The bot ships a tiny HTTP server at /health so Render + UptimeRobot
+    # can ping it and keep the free service from sleeping.
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false          # must be filled in manually on the dashboard
+      # NOTE: do NOT set WEBHOOK_URL. When it is unset/empty the bot runs in
+      # POLLING mode, which is what we want here.

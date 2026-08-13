@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data.db
+.git/
+.gitignore
+.gitattributes
+*.xlsx
+*_report.csv

@@ -1,0 +1,48 @@
+# ============================================================
+# SAMPLE TEST DATA (100% fake / synthetic — for education only)
+# Cards use publicly-known TEST numbers. Nothing here is real.
+# ============================================================
+
+# --- CARDS (brand filter demo) ---
+4111111111111111|05|33|496 — 🇦🇪 AE
+5555555555554444|11|30|123 — 🇺🇸 US
+378282246310005|08|29|4567 — 🇬🇧 GB
+6011111111111117|02|28|999 — 🇮🇳 IN
+3530111333300000|05|33|123 — 🇦🇪 AE
+5105105105105100|12|31|999 — 🇦🇪 AE
+
+# --- EMAIL COMBOS (domain filter demo) ---
+alice.johnson@gmail.com:Tr0ub4dor&3 — 🇺🇸 US
+bob.smith@outlook.com:Hunter2!x — 🇬🇧 GB
+carol@company.org:Passw0rd@2026 — 🇦🇪 AE
+dave@yahoo.com:MyP@ssw0rd99 — 🇮🇳 IN
+maria@gmail.com:password — 🇦🇪 AE
+
+# --- PHONE COMBOS (country-code filter demo) ---
++14155552671:Str0ngPass! — 🇺🇸 US
++447700900123:S3cure@Pass — 🇬🇧 GB
++919876543210:India#2026 — 🇮🇳 IN
++971501234567:DubaiPass1 — 🇦🇪 AE
+
+# --- PROXIES (protocol + port filter demo) ---
+1.2.3.4:8080 — 🇺🇸 US
+5.6.7.8:3128 — 🇬🇧 GB
+socks5://10.0.0.1:1080 — 🇮🇳 IN
+http://user:pass@11.22.33.44:8080 — 🇦🇪 AE
+socks4://99.88.77.66:4145
+host.example.com:8080 — 🇺🇸 US
+
+# --- URLS (domain filter demo) ---
+https://example.com/page1
+https://example.com/page2
+https://news.site.co/article — 🇬🇧 GB
+
+# --- CRYPTO (network filter demo) ---
+0x52908400098527886E0F7030069857D2E4169EE7
+bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh
+1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2
+
+# --- JUNK (auto-skipped) ---
+tg://resolve?domain=yorichiiprime
+t.me/yorichiiprime
+admin, [12/08/2026 14:00] some telegram header
