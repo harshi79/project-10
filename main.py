@@ -1,26 +1,25 @@
 """
-Yori Cleaner Bot — Telegram file processing + fake-data filtering bot.
+Yori Cleaner Bot — Telegram advanced filtering bot.
 
-What it does now:
-  • Parses .txt files of cards / email combos / phone combos (mixed files too)
-  • VALIDATES every entry and classifies it as VALID or FAKE:
-      - Cards   : Luhn checksum, BIN brand, length, expiry, CVV
-      - Emails  : format + disposable (temp-mail) domain detection
-      - Phones  : number format + length
-      - Passwords: common-password list + strength scoring
-  • Lets you filter output to Valid only / Fake only / All
-  • Outputs TXT, CSV and a real Excel (.xlsx) report with Status + Reason
-  • Per-user and global stats, broadcast, queue history
+Parses .txt files of cards / email combos / phone combos (mixed files too),
+cleans them, deduplicates, and lets you FILTER the output:
+
+  • Type filter      — Cards / Emails / Phones / All
+  • Brand filter     — card brand from BIN (Visa, Mastercard, Amex, …)
+  • Country filter   — country tag at end of line (e.g. "… — 🇦🇪 AE")
+  • Phone code filter— country code (e.g. +91, +1, +44)
+  • Domain filter    — email domain + sort by domain
+  • Junk removal     — URLs, telegram headers, comments, blank lines
+  • Deduplication    — exact + case-insensitive duplicates
+
+Output: TXT, CSV, Excel (.xlsx)
 
 All data used is fake/test data — this is an educational project about how
-filtering works, nothing else. No card or account is ever contacted.
-
-Offline demo (no internet / no deps):   python validator.py sample.txt
-Run the bot:                             set TELEGRAM_BOT_TOKEN, then python main.py
+filtering works, nothing else. No account or card is ever contacted.
 """
 
 import os
-import sys
+import re
 import csv as _csv
 import sqlite3
 import logging
@@ -48,19 +47,6 @@ from telegram.ext import (
 from telegram.error import Forbidden, BadRequest
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-
-from validator import (
-    analyse_line,
-    analyse_file,
-    validate_card,
-    validate_email,
-    validate_password,
-    validate_phone,
-    luhn_check,
-    count_valid,
-    filter_entries,
-    reason_str,
-)
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 
@@ -121,8 +107,6 @@ def init_db() -> None:
                 lines     INTEGER DEFAULT 0,
                 cards     INTEGER DEFAULT 0,
                 combos    INTEGER DEFAULT 0,
-                valid     INTEGER DEFAULT 0,
-                fake      INTEGER DEFAULT 0,
                 last_seen TEXT    DEFAULT ''
             )
         """)
@@ -135,22 +119,15 @@ def init_db() -> None:
                 ts       TEXT
             )
         """)
-        # Migration for DBs created before the valid/fake columns existed
-        cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
-        if "valid" not in cols:
-            c.execute("ALTER TABLE users ADD COLUMN valid INTEGER DEFAULT 0")
-        if "fake" not in cols:
-            c.execute("ALTER TABLE users ADD COLUMN fake INTEGER DEFAULT 0")
 
 
-def upsert_user(uid: int, name: str, username: str, n_cards: int, n_combos: int,
-                n_valid: int, n_fake: int) -> None:
+def upsert_user(uid: int, name: str, username: str, n_cards: int, n_combos: int) -> None:
     total = n_cards + n_combos
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     with _conn() as c:
         c.execute("""
-            INSERT INTO users (id, name, username, files, lines, cards, combos, valid, fake, last_seen)
-            VALUES (?,?,?,1,?,?,?,?,?,?)
+            INSERT INTO users (id, name, username, files, lines, cards, combos, last_seen)
+            VALUES (?,?,?,1,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 name      = excluded.name,
                 username  = excluded.username,
@@ -158,10 +135,8 @@ def upsert_user(uid: int, name: str, username: str, n_cards: int, n_combos: int,
                 lines     = lines  + excluded.lines,
                 cards     = cards  + excluded.cards,
                 combos    = combos + excluded.combos,
-                valid     = valid  + excluded.valid,
-                fake      = fake   + excluded.fake,
                 last_seen = excluded.last_seen
-        """, (uid, name, username, total, n_cards, n_combos, n_valid, n_fake, ts))
+        """, (uid, name, username, total, n_cards, n_combos, ts))
 
 
 def get_user(uid: int):
@@ -179,12 +154,10 @@ def get_global_stats():
         total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         total_files = c.execute("SELECT COALESCE(SUM(files),0) FROM users").fetchone()[0]
         total_lines = c.execute("SELECT COALESCE(SUM(lines),0) FROM users").fetchone()[0]
-        total_valid = c.execute("SELECT COALESCE(SUM(valid),0) FROM users").fetchone()[0]
-        total_fake  = c.execute("SELECT COALESCE(SUM(fake),0) FROM users").fetchone()[0]
         top5 = c.execute(
             "SELECT name, username, lines FROM users ORDER BY lines DESC LIMIT 5"
         ).fetchall()
-    return total_users, total_files, total_lines, total_valid, total_fake, top5
+    return total_users, total_files, total_lines, top5
 
 
 def log_queue(uid: int, filename: str, status: str) -> None:
@@ -202,13 +175,212 @@ def get_queue_history(uid: int, limit: int = 10):
         ).fetchall()
 
 
-# ── Combo helpers ───────────────────────────────────────────────────────────────
+# ── Smart Line Analyser ─────────────────────────────────────────────────────────
+
+CARD_RE = re.compile(
+    r"^(\d{13,19})[\s|:;]+(\d{1,2})[\s|:;]+(\d{2,4})[\s|:;]+(\d{3,4})"
+    r"(?:[\s]*[\u2014\u2013\-]+.*)?$"
+)
+EMAIL_RE       = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
+EMAIL_SEP_RE   = re.compile(r"^([^\s@:;|]+@[^\s@:;|]+\.[^\s@:;|]{2,})[:;|](.+)$")
+EMAIL_SPACE_RE = re.compile(r"^([^\s@]+@[^\s@]+\.[^\s@]{2,})\s+(\S+)$")
+PHONE_SEP_RE   = re.compile(r"^(\+\d{7,15}|\d{7,12})[:;|](.+)$")
+PHONE_SPACE_RE = re.compile(r"^(\+\d{7,15})\s+(\S+)$")
+JUNK_RE        = re.compile(r"^(https?://|tg://|t\.me/)", re.I)
+TG_HEAD_RE     = re.compile(r"^.{1,80},\s*\[\d{1,2}/\d{1,2}/\d{4}")
+
+# Country tag at the end of a line: "… — 🇦🇪 AE"  (flag optional)
+COUNTRY_RE = re.compile(
+    r"[\u2014\u2013\-]\s*(?:[\U0001F1E6-\U0001F1FF]{2}\s*)?([A-Za-z]{2})\s*$"
+)
+
+# Common ITU country calling codes (E.164). Used for longest-prefix matching so
+# "+14155552671" → "+1" (US), "+919876543210" → "+91" (India), etc.
+COUNTRY_CODES = {
+    "1", "7", "20", "27", "30", "31", "32", "33", "34", "36", "39", "40",
+    "41", "43", "44", "45", "46", "47", "48", "49", "51", "52", "53", "54",
+    "55", "56", "57", "58", "60", "61", "62", "63", "64", "65", "66", "81",
+    "82", "84", "86", "90", "91", "92", "93", "94", "95", "98", "211", "212",
+    "213", "216", "218", "220", "221", "222", "223", "224", "225", "226",
+    "227", "228", "229", "230", "231", "232", "233", "234", "235", "236",
+    "237", "238", "239", "240", "241", "242", "243", "244", "245", "246",
+    "247", "248", "249", "250", "251", "252", "253", "254", "255", "256",
+    "257", "258", "260", "261", "262", "263", "264", "265", "266", "267",
+    "268", "269", "290", "291", "297", "298", "299", "350", "351", "352",
+    "353", "354", "355", "356", "357", "358", "359", "370", "371", "372",
+    "373", "374", "375", "376", "377", "378", "380", "381", "382", "383",
+    "385", "386", "387", "389", "420", "421", "423", "500", "501", "502",
+    "503", "504", "505", "506", "507", "508", "509", "590", "591", "592",
+    "593", "594", "595", "596", "597", "598", "599", "670", "672", "673",
+    "674", "675", "676", "677", "678", "679", "680", "681", "682", "683",
+    "685", "686", "687", "688", "689", "690", "691", "692", "850", "852",
+    "853", "855", "856", "880", "886", "960", "961", "962", "963", "964",
+    "965", "966", "967", "968", "970", "971", "972", "973", "974", "975",
+    "976", "977", "992", "993", "994", "995", "996", "998",
+}
+CODE_KEYS = sorted(COUNTRY_CODES, key=lambda c: (-len(c), -int(c)))
+
+# Brand detection from BIN (first digits) — used for FILTERING, not validation.
+BRAND_RULES = [
+    ("Visa",             lambda n: n[0] == "4"),
+    ("Mastercard",       lambda n: len(n) >= 2 and 51 <= int(n[:2]) <= 55),
+    ("Mastercard",       lambda n: len(n) >= 4 and 2221 <= int(n[:4]) <= 2720),
+    ("American Express", lambda n: n.startswith(("34", "37"))),
+    ("Discover",         lambda n: len(n) >= 6 and 622126 <= int(n[:6]) <= 622925),
+    ("Discover",         lambda n: n.startswith(("6011", "65"))),
+    ("JCB",              lambda n: len(n) >= 4 and 3528 <= int(n[:4]) <= 3589),
+    ("UnionPay",         lambda n: n.startswith("62")),
+    ("Diners Club",      lambda n: n.startswith(("300", "301", "302", "303", "304", "305", "36", "38"))),
+    ("Maestro",          lambda n: n.startswith(("50", "56", "57", "58", "63"))),
+]
+
+
+def card_brand(number: str) -> str:
+    n = "".join(c for c in number if c.isdigit())
+    for brand, rule in BRAND_RULES:
+        if n and rule(n):
+            return brand
+    return "Unknown"
+
+
+def extract_country(raw: str):
+    """Return (country_code_or_None, line_without_tag)."""
+    m = COUNTRY_RE.search(raw)
+    if m:
+        return m.group(1).upper(), raw[:m.start()].rstrip()
+    return None, raw
+
+
+def phone_code(phone: str):
+    m = re.match(r"^\+(\d+)", phone.strip())
+    if not m:
+        return None
+    digits = m.group(1)
+    for code in CODE_KEYS:
+        if digits.startswith(code):
+            return f"+{code}"
+    return None
+
+
+def analyse_line(raw: str):
+    """Classify a single line.
+
+    Returns one of:
+      ("card",  num, mm, yy, cvv, country)
+      ("combo", email, pw, country)
+      ("phone", phone, pw, country, code)
+      None
+    """
+    t = raw.strip()
+    if not t or t.startswith("#"):
+        return None
+    if JUNK_RE.match(t) or TG_HEAD_RE.match(t):
+        return None
+
+    country, t = extract_country(t)
+    t = t.strip()
+    if not t:
+        return None
+
+    m = CARD_RE.match(t)
+    if m:
+        num, mm, yy, cvv = m.groups()
+        return ("card", num, mm, yy, cvv, country)
+
+    m = EMAIL_SEP_RE.match(t)
+    if m:
+        email, pw = m.group(1).strip(), m.group(2).strip()
+        if EMAIL_RE.match(email) and pw:
+            return ("combo", email, pw, country)
+
+    if "@" in t:
+        m = EMAIL_SPACE_RE.match(t)
+        if m:
+            email, pw = m.group(1).strip(), m.group(2).strip()
+            if EMAIL_RE.match(email) and pw:
+                return ("combo", email, pw, country)
+
+    m = PHONE_SEP_RE.match(t)
+    if m:
+        phone, pw = m.group(1).strip(), m.group(2).strip()
+        if pw:
+            return ("phone", phone, pw, country, phone_code(phone))
+
+    m = PHONE_SPACE_RE.match(t)
+    if m:
+        phone, pw = m.group(1).strip(), m.group(2).strip()
+        if pw:
+            return ("phone", phone, pw, country, phone_code(phone))
+
+    return None
+
+
+def analyse_file(content: str) -> dict:
+    cards:  list[dict] = []
+    combos: list[dict] = []
+    phones: list[dict] = []
+    seen_cards, seen_combos, seen_phones = set(), set(), set()
+    skipped = 0
+    total_nonempty = sum(
+        1 for l in content.splitlines()
+        if l.strip() and not l.lstrip().startswith("#")
+    )
+
+    for raw in content.splitlines():
+        r = analyse_line(raw)
+        if r is None:
+            if raw.strip() and not raw.lstrip().startswith("#"):
+                skipped += 1
+            continue
+
+        if r[0] == "card":
+            _, num, mm, yy, cvv, country = r
+            value = f"{num}|{mm}|{yy}|{cvv}"
+            if value in seen_cards:
+                skipped += 1
+                continue
+            seen_cards.add(value)
+            cards.append({
+                "value": value, "num": num, "mm": mm, "yy": yy, "cvv": cvv,
+                "brand": card_brand(num), "country": country,
+            })
+
+        elif r[0] == "combo":
+            _, email, pw, country = r
+            key = f"{email.lower()}:::{pw}"
+            if key in seen_combos:
+                skipped += 1
+                continue
+            seen_combos.add(key)
+            combos.append({
+                "email": email, "pw": pw,
+                "domain": email.rsplit("@", 1)[-1].lower(), "country": country,
+            })
+
+        elif r[0] == "phone":
+            _, phone, pw, country, code = r
+            key = f"{phone}:::{pw}"
+            if key in seen_phones:
+                skipped += 1
+                continue
+            seen_phones.add(key)
+            phones.append({
+                "phone": phone, "pw": pw, "code": code, "country": country,
+            })
+
+    return {
+        "cards": cards, "combos": combos, "phones": phones,
+        "skipped": skipped, "total": total_nonempty,
+    }
+
+
+# ── Filter helpers ──────────────────────────────────────────────────────────────
 
 def get_domains(combos: list[dict]) -> list[str]:
-    domain_counts: dict[str, int] = defaultdict(int)
+    counts: dict[str, int] = defaultdict(int)
     for c in combos:
-        domain_counts[c["domain"]] += 1
-    return sorted(domain_counts.keys(), key=lambda d: (-domain_counts[d], d))
+        counts[c["domain"]] += 1
+    return sorted(counts.keys(), key=lambda d: (-counts[d], d))
 
 
 def sort_combos_by_domain(combos: list[dict]) -> list[dict]:
@@ -219,7 +391,39 @@ def filter_combos_by_domain(combos: list[dict], domain: str) -> list[dict]:
     return [c for c in combos if c["domain"] == domain.lower()]
 
 
-# ── Output builders ─────────────────────────────────────────────────────────────
+def get_available_brands(cards: list[dict]) -> list[str]:
+    return sorted({c["brand"] for c in cards})
+
+
+def get_available_countries(cards: list[dict], combos: list[dict], phones: list[dict]) -> list[str]:
+    codes = set()
+    for c in cards:
+        if c.get("country"):
+            codes.add(c["country"])
+    for c in combos:
+        if c.get("country"):
+            codes.add(c["country"])
+    for c in phones:
+        if c.get("country"):
+            codes.add(c["country"])
+    return sorted(codes)
+
+
+def get_available_codes(phones: list[dict]) -> list[str]:
+    return sorted({c["code"] for c in phones if c.get("code")})
+
+
+def next_choice(current, options: list[str]):
+    """Cycle through [None(All), *options]."""
+    seq = [None] + list(options)
+    try:
+        i = seq.index(current)
+    except ValueError:
+        i = 0
+    return seq[(i + 1) % len(seq)]
+
+
+# ── Output Builders ─────────────────────────────────────────────────────────────
 
 def build_txt(cards: list, combos: list, phones: list) -> str:
     parts: list[str] = []
@@ -243,22 +447,18 @@ def build_txt(cards: list, combos: list, phones: list) -> str:
 def build_csv(cards: list, combos: list, phones: list) -> str:
     rows: list[list] = []
     if cards:
-        rows.append(["Type", "Number", "Month", "Year", "CVV", "Brand", "Status", "Reason"])
+        rows.append(["Type", "Number", "Month", "Year", "CVV", "Brand", "Country"])
         for c in cards:
-            rows.append(["card", c["num"], c["mm"], c["yy"], c["cvv"], c["brand"],
-                         "VALID" if c["valid"] else "FAKE", reason_str(c["reasons"])])
+            rows.append(["card", c["num"], c["mm"], c["yy"], c["cvv"],
+                         c["brand"], c.get("country") or ""])
     if combos:
-        rows.append(["Type", "Email", "Password", "Domain", "Status", "Reason", "Strength"])
+        rows.append(["Type", "Email", "Password", "Domain", "Country"])
         for c in combos:
-            rows.append(["combo", c["email"], c["pw"], c["domain"],
-                         "VALID" if c["valid"] else "FAKE",
-                         reason_str(c["reasons"]), c["pw_strength"]])
+            rows.append(["combo", c["email"], c["pw"], c["domain"], c.get("country") or ""])
     if phones:
-        rows.append(["Type", "Phone", "Password", "Status", "Reason", "Strength"])
+        rows.append(["Type", "Phone", "Password", "Code", "Country"])
         for c in phones:
-            rows.append(["phone", c["phone"], c["pw"],
-                         "VALID" if c["valid"] else "FAKE",
-                         reason_str(c["reasons"]), c["pw_strength"]])
+            rows.append(["phone", c["phone"], c["pw"], c.get("code") or "", c.get("country") or ""])
     buf = StringIO()
     _csv.writer(buf).writerows(rows)
     return buf.getvalue()
@@ -276,15 +476,6 @@ def _write_table(ws, headers: list, rows: list) -> None:
         _style_header(cell)
     for row in rows:
         ws.append(row)
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=len(headers)):
-        for cell in row:
-            v = str(cell.value or "")
-            if v == "FAKE":
-                cell.fill = PatternFill("solid", fgColor="FFC7CE")
-                cell.font = Font(color="9C0006")
-            elif v == "VALID":
-                cell.fill = PatternFill("solid", fgColor="C6EFCE")
-                cell.font = Font(color="006100")
     for col in ws.columns:
         letter = col[0].column_letter
         m = max((len(str(c.value)) for c in col if c.value is not None), default=8)
@@ -292,23 +483,15 @@ def _write_table(ws, headers: list, rows: list) -> None:
 
 
 def _write_summary_sheet(ws, cards: list, combos: list, phones: list) -> None:
-    ws.append(["Yori Cleaner — Fake-Data Filtering Report"])
+    ws.append(["Yori Cleaner — Filtered Output"])
     ws.append(["Generated", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")])
     ws.append([])
-    ws.append(["Type", "Total", "Valid", "Fake", "Fake %"])
+    ws.append(["Type", "Total"])
     for cell in ws[4]:
         _style_header(cell)
     for name, entries in (("Cards", cards), ("Emails", combos), ("Phones", phones)):
-        total = len(entries)
-        v = count_valid(entries)
-        f = total - v
-        pct = f"{f / total * 100:.1f}%" if total else "0%"
-        ws.append([name, total, v, f, pct])
-    ws.append([])
-    ws.append(["Note",
-               "Validation is structural (Luhn checksum, format, disposable-domain "
-               "& common-password heuristics). Educational use on test data only."])
-    for letter, width in (("A", 12), ("B", 10), ("C", 10), ("D", 10), ("E", 10)):
+        ws.append([name, len(entries)])
+    for letter, width in (("A", 12), ("B", 10)):
         ws.column_dimensions[letter].width = width
 
 
@@ -322,24 +505,19 @@ def build_xlsx(cards: list, combos: list, phones: list) -> bytes:
     if cards:
         ws_c = wb.create_sheet("Cards")
         _write_table(ws_c,
-                     ["Number", "Month", "Year", "CVV", "Brand", "Status", "Reason"],
+                     ["Number", "Month", "Year", "CVV", "Brand", "Country"],
                      [[c["num"], c["mm"], c["yy"], c["cvv"], c["brand"],
-                       "VALID" if c["valid"] else "FAKE",
-                       reason_str(c["reasons"])] for c in cards])
+                       c.get("country") or ""] for c in cards])
     if combos:
         ws_e = wb.create_sheet("Emails")
         _write_table(ws_e,
-                     ["Email", "Password", "Domain", "Status", "Reason", "Strength"],
-                     [[c["email"], c["pw"], c["domain"],
-                       "VALID" if c["valid"] else "FAKE",
-                       reason_str(c["reasons"]), c["pw_strength"]] for c in combos])
+                     ["Email", "Password", "Domain", "Country"],
+                     [[c["email"], c["pw"], c["domain"], c.get("country") or ""] for c in combos])
     if phones:
         ws_p = wb.create_sheet("Phones")
         _write_table(ws_p,
-                     ["Phone", "Password", "Status", "Reason", "Strength"],
-                     [[c["phone"], c["pw"],
-                       "VALID" if c["valid"] else "FAKE",
-                       reason_str(c["reasons"]), c["pw_strength"]] for c in phones])
+                     ["Phone", "Password", "Code", "Country"],
+                     [[c["phone"], c["pw"], c.get("code") or "", c.get("country") or ""] for c in phones])
 
     buf = BytesIO()
     wb.save(buf)
@@ -356,8 +534,8 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 def type_ikb(cards: list, combos: list, phones: list, uid: int, fmt: str = "txt",
              selected_types: set | None = None, domain: str | None = None,
-             sort: bool = False, validity: str = "all") -> InlineKeyboardMarkup:
-    """Inline keyboard: format, types, valid/fake filter, domains, generate."""
+             sort: bool = False, brand: str | None = None,
+             country: str | None = None, code: str | None = None) -> InlineKeyboardMarkup:
     rows = []
     sel = selected_types or set()
 
@@ -385,17 +563,22 @@ def type_ikb(cards: list, combos: list, phones: list, uid: int, fmt: str = "txt"
     if type_row:
         rows.append(type_row)
 
-    # Row 3: Valid / Fake filter
-    rows.append([
-        InlineKeyboardButton(f"🟢 Valid {'✅' if validity == 'valid' else ''}",
-                             callback_data=f"val:valid:{uid}"),
-        InlineKeyboardButton(f"🔴 Fake {'✅' if validity == 'fake' else ''}",
-                             callback_data=f"val:fake:{uid}"),
-        InlineKeyboardButton(f"🔀 All {'✅' if validity == 'all' else ''}",
-                             callback_data=f"val:all:{uid}"),
-    ])
+    # Row 3: Advanced filters (cycle buttons)
+    filter_row = []
+    if cards:
+        filter_row.append(InlineKeyboardButton(
+            f"💳 Brand: {brand or 'All'}", callback_data=f"brand:{uid}"))
+    countries = get_available_countries(cards, combos, phones)
+    if countries:
+        filter_row.append(InlineKeyboardButton(
+            f"🌍 Country: {country or 'All'}", callback_data=f"cty:{uid}"))
+    if phones:
+        filter_row.append(InlineKeyboardButton(
+            f"📞 Code: {code or 'All'}", callback_data=f"code:{uid}"))
+    if filter_row:
+        rows.append(filter_row)
 
-    # Domain buttons (if combos exist)
+    # Row 4: Domain filter + sort
     if combos:
         domains = get_domains(combos)[:5]
         if domains:
@@ -426,8 +609,7 @@ def result_ikb(uid: int) -> InlineKeyboardMarkup:
 HELP_TEXT = (
     "<b>ℹ️ How to use</b>\n"
     "──────────────────\n"
-    "Send any <b>.txt</b> file. Every line is analysed and classified as\n"
-    "🟢 <b>VALID</b> (passes checks) or 🔴 <b>FAKE</b> (filtered out).\n\n"
+    "Send any <b>.txt</b> file. Every line is analysed and cleaned:\n\n"
     "💳 <b>Cards</b> — any separator:\n"
     "  <code>4111111111111111|05|33|496 — 🇦🇪 AE</code>\n"
     "  <code>4111111111111111 05 33 496</code>\n\n"
@@ -435,15 +617,15 @@ HELP_TEXT = (
     "  <code>user@gmail.com:Password1</code>\n"
     "  <code>user@gmail.com|Password1</code>\n\n"
     "📱 <b>Phone combos</b>:\n"
-    "  <code>+12345678901:Password1</code>\n\n"
-    "🔍 <b>What is checked:</b>\n"
-    "  💳 Luhn checksum, brand, length, expiry, CVV\n"
-    "  📧 format + disposable (temp-mail) domains\n"
-    "  📱 number format + length\n"
-    "  🔑 common / weak passwords\n\n"
-    "🧪 Quick single-line check:\n"
-    "  <code>/check 4111111111111111|05|33|496</code>\n\n"
-    "📊 Choose TXT / CSV / Excel and filter Valid / Fake / All.\n\n"
+    "  <code>+12345678901:Password1</code>\n"
+    "  <code>12345678901:Password1</code>\n\n"
+    "🧰 <b>Filters (tap to cycle)</b>:\n"
+    "  💳 Brand — Visa / Mastercard / Amex / …\n"
+    "  🌍 Country — from the country tag at line end\n"
+    "  📞 Code — phone country code (+91, +1, +44 …)\n"
+    "  📧 Domain — email domain + sort by domain\n\n"
+    "🗑️ Junk (URLs, telegram headers, comments) is removed automatically.\n"
+    "📊 Choose output format: TXT / CSV / Excel\n\n"
     "<i>— @yorifederation</i>"
 )
 
@@ -452,16 +634,17 @@ ABOUT_TEXT = (
     "──────────────────\n"
     "⚡ Instant .txt file analysis\n"
     "🧠 Fuzzy per-line pattern detection\n"
-    "💳 Card validation (Luhn, BIN, expiry, CVV)\n"
-    "📧 Disposable / temp-mail domain detection\n"
-    "📱 Phone number format validation\n"
-    "🔑 Common-password + strength analysis\n"
-    "🟢🔴 Valid / Fake classification & filtering\n"
-    "📊 TXT / CSV / real Excel (.xlsx) report\n"
+    "💳 Filter by card brand (BIN)\n"
+    "🌍 Filter by country tag\n"
+    "📞 Filter by phone country code\n"
+    "📧 Filter by email domain\n"
+    "🔀 Mixed files in one pass\n"
+    "🗑️ Automatic junk removal\n"
     "🔑 Deduplication built in\n"
+    "📊 TXT / CSV / Excel output\n"
+    "💧 Auto-watermark on every output\n"
     "📊 Per-user stats (SQLite)\n\n"
-    "<i>Educational use on test data only.\n"
-    "— @yorifederation</i>"
+    "<i>— @yorifederation</i>"
 )
 
 
@@ -470,19 +653,17 @@ def user_stats_text(row) -> str:
         f"<b>📊 Your Stats</b>\n"
         f"──────────────────\n"
         f"👤 {row['name'] or 'Unknown'}  <i>{row['username']}</i>\n\n"
-        f"📁 Files processed  <b>{row['files']:,}</b>\n"
-        f"📝 Total lines      <b>{row['lines']:,}</b>\n"
-        f"💳 Card lines       <b>{row['cards']:,}</b>\n"
-        f"🔑 Combo lines      <b>{row['combos']:,}</b>\n"
-        f"🟢 Valid entries    <b>{row['valid']:,}</b>\n"
-        f"🔴 Fake entries     <b>{row['fake']:,}</b>\n\n"
+        f"📁 Files cleaned  <b>{row['files']:,}</b>\n"
+        f"📝 Total lines    <b>{row['lines']:,}</b>\n"
+        f"💳 Card lines     <b>{row['cards']:,}</b>\n"
+        f"🔑 Combo lines    <b>{row['combos']:,}</b>\n\n"
         f"🕒 <i>{row['last_seen']}</i>\n\n"
         f"<i>— @yorifederation</i>"
     )
 
 
 def global_stats_text() -> str:
-    total_users, total_files, total_lines, total_valid, total_fake, top5 = get_global_stats()
+    total_users, total_files, total_lines, top5 = get_global_stats()
     top_str = "\n".join(
         f"  {i + 1}. {r['name'] or r['username']} — {r['lines']:,} lines"
         for i, r in enumerate(top5)
@@ -492,69 +673,10 @@ def global_stats_text() -> str:
         f"──────────────────\n"
         f"👥 Total users   <b>{total_users:,}</b>\n"
         f"📁 Total files   <b>{total_files:,}</b>\n"
-        f"📝 Total lines   <b>{total_lines:,}</b>\n"
-        f"🟢 Valid entries <b>{total_valid:,}</b>\n"
-        f"🔴 Fake entries  <b>{total_fake:,}</b>\n\n"
+        f"📝 Total lines   <b>{total_lines:,}</b>\n\n"
         f"🏆 <b>Top 5</b>\n{top_str}\n\n"
         f"<i>— @yorifederation</i>"
     )
-
-
-def check_text(raw: str) -> str:
-    """HTML verdict for a single line (used by /check)."""
-    r = analyse_line(raw)
-    if r is None:
-        return (
-            "❓ <b>Not recognised.</b>\n\n"
-            "Send a card, email:pass or phone:pass line, e.g.:\n"
-            "<code>4111111111111111|05|33|496</code>\n"
-            "<code>user@gmail.com:Password1</code>\n"
-            "<code>+12345678901:Password1</code>"
-        )
-
-    if r[0] == "card":
-        _, num, mm, yy, cvv = r
-        v = validate_card(num, mm, yy, cvv)
-        verdict = "🟢 <b>VALID</b>" if v["valid"] else "🔴 <b>FAKE</b>"
-        out = (f"{verdict}\n"
-               f"━━━━━━━━━━━━━━━━\n"
-               f"💳 {num}\n"
-               f"🏷️ Brand: <b>{v['brand']}</b>\n"
-               f"📅 Expiry: {mm}/{yy}\n"
-               f"🔒 CVV: {cvv}\n"
-               f"🧪 Luhn: {'pass 🟢' if luhn_check(num) else 'fail 🔴'}\n")
-        out += (f"⚠️ Reasons: {reason_str(v['reasons'])}" if v["reasons"]
-                else "✅ No issues found")
-        return out
-
-    if r[0] == "combo":
-        _, email, pw = r
-        e = validate_email(email)
-        p = validate_password(pw)
-        valid = e["valid"] and p["valid"]
-        verdict = "🟢 <b>VALID</b>" if valid else "🔴 <b>FAKE</b>"
-        lines = [
-            f"{verdict}",
-            "━━━━━━━━━━━━━━━━",
-            f"📧 {email}",
-            f"🌐 Domain: {e['domain']}",
-            f"🔑 Password strength: <b>{p['strength']}</b>",
-        ]
-        reasons = list(e["reasons"]) + [f"password: {x}" for x in p["reasons"]]
-        lines.append(f"⚠️ Reasons: {reason_str(reasons)}" if reasons else "✅ No issues found")
-        return "\n".join(lines)
-
-    _, phone, pw = r
-    ph = validate_phone(phone)
-    p = validate_password(pw)
-    valid = ph["valid"] and p["valid"]
-    verdict = "🟢 <b>VALID</b>" if valid else "🔴 <b>FAKE</b>"
-    reasons = list(ph["reasons"]) + [f"password: {x}" for x in p["reasons"]]
-    return (f"{verdict}\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"📱 {phone}\n"
-            f"🔑 Password strength: <b>{p['strength']}</b>\n"
-            + (f"⚠️ Reasons: {reason_str(reasons)}" if reasons else "✅ No issues found"))
 
 
 # ── Handlers ────────────────────────────────────────────────────────────────────
@@ -567,29 +689,16 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Welcome, <b>{name}</b>.\n\n"
         f"Drop a <b>.txt</b> file and I will:\n"
         f"  🧠 Analyse every line automatically\n"
-        f"  🟢🔴 Classify each entry as VALID or FAKE\n"
-        f"  💳 Check Luhn / BIN / expiry / CVV\n"
-        f"  📧 Detect disposable emails & weak passwords\n"
-        f"  📊 Let you export TXT / CSV / Excel\n"
-        f"  🚫 Filter out the fake ones (Valid / Fake / All)\n\n"
+        f"  🗑️ Remove junk (URLs, headers, comments)\n"
+        f"  🔑 Deduplicate entries\n"
+        f"  💳 Filter by card brand\n"
+        f"  🌍 Filter by country\n"
+        f"  📞 Filter by phone country code\n"
+        f"  📧 Filter by email domain\n"
+        f"  📊 Export TXT / CSV / Excel\n\n"
         f"No commands needed — just send the file.",
         parse_mode="HTML", reply_markup=MAIN_KB,
     )
-
-
-async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.args:
-        await update.message.reply_text(
-            "🧪 <b>Check a single line</b>\n"
-            "Usage:\n"
-            "<code>/check 4111111111111111|05|33|496</code>\n"
-            "<code>/check user@gmail.com:Password1</code>\n"
-            "<code>/check +12345678901:Password1</code>",
-            parse_mode="HTML",
-        )
-        return
-    raw = " ".join(ctx.args)
-    await update.message.reply_text(check_text(raw), parse_mode="HTML")
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -676,7 +785,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     thinking = await update.message.reply_text(
-        "🧠 <b>Analysing & validating file…</b>", parse_mode="HTML"
+        "🧠 <b>Analysing file…</b>", parse_mode="HTML"
     )
 
     try:
@@ -716,8 +825,10 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 "selected_types": set(),
                 "selected_format": "txt",
                 "selected_domain": None,
+                "selected_brand": None,
+                "selected_country": None,
+                "selected_code": None,
                 "sort_by_domain": False,
-                "selected_validity": "all",
                 "status": "analysed",
                 "user_name": full_name,
                 "user_username": uname,
@@ -726,14 +837,11 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
         type_parts = []
         if cards:
-            v = count_valid(cards)
-            type_parts.append(f"💳 <b>Cards:</b> {len(cards)}  <i>(🟢 {v} · 🔴 {len(cards) - v})</i>")
+            type_parts.append(f"💳 <b>Cards:</b> {len(cards)}")
         if combos:
-            v = count_valid(combos)
-            type_parts.append(f"🔑 <b>Emails:</b> {len(combos)}  <i>(🟢 {v} · 🔴 {len(combos) - v})</i>")
+            type_parts.append(f"🔑 <b>Emails:</b> {len(combos)}")
         if phones:
-            v = count_valid(phones)
-            type_parts.append(f"📱 <b>Phones:</b> {len(phones)}  <i>(🟢 {v} · 🔴 {len(phones) - v})</i>")
+            type_parts.append(f"📱 <b>Phones:</b> {len(phones)}")
         if skipped:
             type_parts.append(f"🗑️ <b>Skipped:</b> {skipped}")
 
@@ -742,8 +850,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             f"──────────────────\n"
             f"📁 <code>{doc.file_name}</code>\n\n"
             + "\n".join(type_parts) + "\n\n"
-            f"🟢 = valid (passes checks) · 🔴 = fake\n\n"
-            f"👇 <b>Filter & choose format:</b>",
+            f"👇 <b>Apply filters & choose format:</b>",
             parse_mode="HTML",
             reply_markup=type_ikb(cards, combos, phones, uid, "txt"),
         )
@@ -769,8 +876,10 @@ async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -
     fmt = queue_item.get("selected_format", "txt")
     selected_types = queue_item.get("selected_types", set())
     domain = queue_item.get("selected_domain", None)
+    brand = queue_item.get("selected_brand", None)
+    country = queue_item.get("selected_country", None)
+    code = queue_item.get("selected_code", None)
     sort_by_domain = queue_item.get("sort_by_domain", False)
-    validity = queue_item.get("selected_validity", "all")
     user_name = queue_item.get("user_name", "")
     user_username = queue_item.get("user_username", "")
 
@@ -779,21 +888,30 @@ async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -
     out_combos = combos if (not selected_types or "combos" in selected_types) else []
     out_phones = phones if (not selected_types or "phones" in selected_types) else []
 
-    # Domain + sorting
+    # Brand filter
+    if brand and out_cards:
+        out_cards = [c for c in out_cards if c["brand"] == brand]
+
+    # Country filter (applies to all types)
+    if country:
+        out_cards = [c for c in out_cards if c.get("country") == country]
+        out_combos = [c for c in out_combos if c.get("country") == country]
+        out_phones = [c for c in out_phones if c.get("country") == country]
+
+    # Phone code filter
+    if code and out_phones:
+        out_phones = [c for c in out_phones if c.get("code") == code]
+
+    # Domain filter + sort
     if domain and out_combos:
         out_combos = filter_combos_by_domain(out_combos, domain)
     if sort_by_domain and out_combos:
         out_combos = sort_combos_by_domain(out_combos)
 
-    # Valid / Fake filter
-    out_cards = filter_entries(out_cards, validity)
-    out_combos = filter_entries(out_combos, validity)
-    out_phones = filter_entries(out_phones, validity)
-
     if not out_cards and not out_combos and not out_phones:
         await ctx.bot.send_message(
             uid,
-            "⚠️ <b>No data left after filtering.</b>\nTry a different type, domain or valid/fake filter.",
+            "⚠️ <b>No data left after filtering.</b>\nTry a different type, brand, country, code or domain.",
             parse_mode="HTML",
         )
         return
@@ -821,16 +939,19 @@ async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -
         parts.append(f"🔑 Emails: {len(out_combos)}")
     if out_phones:
         parts.append(f"📱 Phones: {len(out_phones)}")
-    if validity == "valid":
-        parts.append("🧪 Filter: 🟢 Valid only")
-    elif validity == "fake":
-        parts.append("🧪 Filter: 🔴 Fake only")
-    else:
-        parts.append("🧪 Filter: All")
+    filters_applied = []
+    if brand:
+        filters_applied.append(f"💳 {brand}")
+    if country:
+        filters_applied.append(f"🌍 {country}")
+    if code:
+        filters_applied.append(f"📞 {code}")
     if domain:
-        parts.append(f"📧 Domain: {domain}")
+        filters_applied.append(f"📧 {domain}")
     if sort_by_domain:
-        parts.append("🔤 Sorted by domain")
+        filters_applied.append("🔤 sorted")
+    if filters_applied:
+        parts.append("🧰 " + " · ".join(filters_applied))
     parts.append(f"📄 Format: {ext.upper()}")
 
     caption = (
@@ -850,15 +971,13 @@ async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -
             reply_markup=result_ikb(uid),
         )
 
-        n_valid = count_valid(out_cards) + count_valid(out_combos) + count_valid(out_phones)
-        n_fake = (len(out_cards) + len(out_combos) + len(out_phones)) - n_valid
         upsert_user(uid, user_name, user_username,
-                    len(out_cards), len(out_combos) + len(out_phones), n_valid, n_fake)
+                    len(out_cards), len(out_combos) + len(out_phones))
 
         log_queue(uid, queue_item["filename"], "done")
-        log.info("Processed %s uid=%s cards=%d combos=%d phones=%d valid=%d fake=%d fmt=%s",
+        log.info("Processed %s uid=%s cards=%d combos=%d phones=%d fmt=%s",
                  queue_item["filename"], uid, len(out_cards), len(out_combos),
-                 len(out_phones), n_valid, n_fake, fmt)
+                 len(out_phones), fmt)
 
     except Exception as e:
         log.error("Error sending file to uid=%s: %s", uid, e)
@@ -883,7 +1002,7 @@ async def _refresh_keyboard(query, item: dict) -> None:
                 item["cards"], item["combos"], item["phones"], item["uid"],
                 item["selected_format"], item["selected_types"],
                 item["selected_domain"], item["sort_by_domain"],
-                item["selected_validity"],
+                item["selected_brand"], item["selected_country"], item["selected_code"],
             )
         )
     except BadRequest:
@@ -924,19 +1043,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             await _refresh_keyboard(query, item)
             await query.answer(f"✅ Format: {fmt.upper()}")
 
-    elif data.startswith("val:"):
-        parts = data.split(":")
-        if len(parts) >= 3:
-            val = parts[1]  # valid | fake | all
-            item = _get_user_queue_item(uid)
-            if not item:
-                await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
-                return
-            item["selected_validity"] = val
-            await _refresh_keyboard(query, item)
-            label = {"valid": "Valid only", "fake": "Fake only", "all": "All entries"}.get(val, val)
-            await query.answer(f"✅ Filter: {label}")
-
     elif data.startswith("sel:"):
         parts = data.split(":")
         if len(parts) >= 3:
@@ -955,6 +1061,36 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
             await _refresh_keyboard(query, item)
             await query.answer(f"✅ Types: {', '.join(item['selected_types']) or 'All'}")
+
+    elif data.startswith("brand:"):
+        item = _get_user_queue_item(uid)
+        if not item:
+            await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+            return
+        options = get_available_brands(item["cards"])
+        item["selected_brand"] = next_choice(item.get("selected_brand"), options)
+        await _refresh_keyboard(query, item)
+        await query.answer(f"✅ Brand: {item['selected_brand'] or 'All'}")
+
+    elif data.startswith("cty:"):
+        item = _get_user_queue_item(uid)
+        if not item:
+            await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+            return
+        options = get_available_countries(item["cards"], item["combos"], item["phones"])
+        item["selected_country"] = next_choice(item.get("selected_country"), options)
+        await _refresh_keyboard(query, item)
+        await query.answer(f"✅ Country: {item['selected_country'] or 'All'}")
+
+    elif data.startswith("code:"):
+        item = _get_user_queue_item(uid)
+        if not item:
+            await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+            return
+        options = get_available_codes(item["phones"])
+        item["selected_code"] = next_choice(item.get("selected_code"), options)
+        await _refresh_keyboard(query, item)
+        await query.answer(f"✅ Code: {item['selected_code'] or 'All'}")
 
     elif data.startswith("seld:"):
         parts = data.split(":")
@@ -1017,8 +1153,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     elif not text.startswith("/"):
         await update.message.reply_text(
-            "👋 <b>Drop a .txt file</b> and I'll analyse & filter it instantly.\n\n"
-            "🟢 valid · 🔴 fake — with reasons for every entry.",
+            "👋 <b>Drop a .txt file</b> and I'll clean & filter it instantly.\n\n"
+            "Use the buttons below to navigate.",
             parse_mode="HTML", reply_markup=MAIN_KB,
         )
 
@@ -1030,8 +1166,7 @@ def main() -> None:
 
     if not TOKEN:
         log.error("TELEGRAM_BOT_TOKEN is not set. Export it and restart.")
-        raise SystemExit("TELEGRAM_BOT_TOKEN environment variable is required. "
-                         "For an offline demo run: python validator.py sample.txt")
+        raise SystemExit("TELEGRAM_BOT_TOKEN environment variable is required.")
 
     threading.Thread(target=_start_health, daemon=True).start()
 
@@ -1041,7 +1176,6 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("queue", cmd_queue))
-    app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -1060,8 +1194,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "--check":
-        from validator import run_cli
-        run_cli(sys.argv[2])
-    else:
-        main()
+    main()

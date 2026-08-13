@@ -1,55 +1,48 @@
-# Yori Cleaner + Fake-Data Filter Bot
+# Yori Cleaner + Filter Bot
 
 A Telegram bot that reads a `.txt` file of **cards**, **email combos** and
-**phone combos**, then **validates every line** and filters out the fake ones.
-Built as a cybersecurity-team school project.
+**phone combos**, cleans them up, and lets you **filter** the output in many
+ways. Built as a cybersecurity-team school project.
 
-> ⚠️ **Educational use only.** All data is fake/test data. The bot checks the
-> *structure* of data (checksums, formats, heuristics). It never contacts any
-> bank, payment network or live service, and it cannot tell you if a card is
-> actually "live" — only whether the data looks well-formed or fake.
-
----
-
-## What it detects
-
-| Type | Checks |
-|------|--------|
-| 💳 Cards | Luhn (mod-10) checksum, BIN brand (Visa/Mastercard/Amex/Discover/JCB/…), length-per-brand, expiry date, CVV length |
-| 📧 Emails | Format (RFC-ish), disposable / temp-mail domains (mailinator, tempmail, …) |
-| 📱 Phones | Number format + length (7–15 digits) |
-| 🔑 Passwords | Common-password list + strength scoring (weak / medium / strong) |
-
-Every entry is labelled **🟢 VALID** (passes checks) or **🔴 FAKE** (filtered
-out), with a human-readable **reason** for each fake.
+> ⚠️ **Educational use only.** All data is fake/test data. The bot only
+> *parses, cleans and filters* text — it never contacts any bank, payment
+> network or live service.
 
 ---
 
 ## Features
 
+### 🧹 Cleaning
 - Auto-detects card / email-combo / phone-combo lines in **mixed files** in one pass
-- **Valid / Fake / All** filtering, plus type, domain and sort-by-domain filters
-- Output as **TXT**, **CSV**, or a real **Excel (.xlsx)** report with a summary
-  sheet and colour-coded VALID/FAKE rows
-- Deduplication, per-user stats, global stats (owner only), broadcast, queue history
-- Quick single-line check: `/check 4111111111111111|05|33|496`
-- Offline CLI demo (no internet, no dependencies)
+- Removes junk automatically (URLs, telegram headers, `#` comments, blank lines)
+- **Deduplication** (exact + case-insensitive email dedupe)
+- Normalises card format to `number|month|year|cvv`
+
+### 🧰 Advanced filters
+| Filter | What it does |
+|--------|--------------|
+| 💳 Brand | Filter cards by brand detected from the BIN (Visa, Mastercard, Amex, Discover, JCB, UnionPay, Diners, Maestro) |
+| 🌍 Country | Filter by the country tag at the end of a line (`… — 🇦🇪 AE`) |
+| 📞 Code | Filter phones by country code (`+91`, `+1`, `+44` …) |
+| 📧 Domain | Filter emails by domain + optional sort-by-domain |
+| 💳🔑📱 Type | Include only Cards / Emails / Phones / All |
+
+### 📊 Output
+- **TXT** — cleaned, optionally sectioned by type
+- **CSV** — with Brand / Country / Code / Domain columns
+- **Excel (.xlsx)** — real workbook with a Summary sheet and one sheet per type
+
+### 👥 Extras
+- Per-user stats (files, lines, cards, combos) in SQLite
+- Global stats + Top 5 (owner only)
+- `/broadcast` to all users (owner only)
+- `/queue` history
+- Health endpoint (`/health`) for hosting
+- Auto-watermark on every TXT output
 
 ---
 
-## Offline demo (no setup needed)
-
-The validation engine is dependency-free. Just run:
-
-```bash
-python validator.py sample.txt
-```
-
-It prints a VALID/FAKE report for every line and writes `sample_report.csv`.
-
----
-
-## Running the Telegram bot
+## Running the bot
 
 1. Install dependencies:
 
@@ -66,44 +59,42 @@ It prints a VALID/FAKE report for every line and writes `sample_report.csv`.
 
    For a hosted setup you can also set `WEBHOOK_URL` and `PORT`.
 
-3. In Telegram, send the bot any `.txt` file (see `sample.txt` for the format),
-   then tap the buttons to filter and export.
+3. Send the bot any `.txt` file (see `sample.txt` for the format), then tap the
+   buttons to filter and export.
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome + instructions |
-| `/check <line>` | Validate a single card / combo / phone line |
-| `📊 My Stats` | Your totals (files, lines, valid, fake) |
+| `📊 My Stats` | Your totals (files, lines, cards, combos) |
 | `/stats` | Global stats (owner only) |
 | `/broadcast <msg>` | Message all users (owner only) |
 | `/queue` | Recent processing history |
 
 ---
 
-## Project layout
+## Input format examples
 
 ```
-main.py        Telegram bot (parsing results → validation → export)
-validator.py   Parsing + validation engine (offline demo lives here)
-sample.txt     Fake/test data for demos
-requirements.txt
+4111111111111111|05|33|496 — 🇦🇪 AE      (card + country tag)
+5555555555554444 11 30 123              (card, space separated)
+alice@gmail.com:Tr0ub4dor&3             (email combo)
++919876543210:India#2026                (phone combo)
 ```
+
+The country tag at the end is optional — if present it powers the 🌍 Country
+filter, and the `+`-prefixed number powers the 📞 Code filter.
 
 ---
 
-## How the Luhn check works (for your viva/exam)
+## Project layout
 
-The Luhn algorithm is a checksum, not a "is this card live" check:
-
-1. Starting from the **right**, double every second digit.
-2. If doubling gives a number > 9, subtract 9.
-3. Sum all digits.
-4. The number is valid if the total is a multiple of 10.
-
-Example: `4111 1111 1111 1111` (a public Visa **test** number) passes; change
-one digit and it fails — that's how fakes with a random number get caught.
+```
+main.py          Telegram bot (parse → clean → filter → export)
+sample.txt       Fake/test data for demos
+requirements.txt
+```
 
 ---
 

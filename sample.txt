@@ -3,39 +3,27 @@
 # Cards use publicly-known TEST numbers. Nothing here is real.
 # ============================================================
 
-# --- CARDS ---
-4111111111111111|05|33|496 — Visa test
-5555555555554444|11|30|123
-378282246310005|08|29|4567
-6011111111111117|02|28|999
-4111111111111112|05|33|496
-1234567890123456|13|99|12
-4111111111111111|05|21|496
-41111111111111|05|33|496
-5555555555554444|05|33|12
-4111111111111111|05|33|496
+# --- CARDS (brand filter demo) ---
+4111111111111111|05|33|496 — 🇦🇪 AE
+5555555555554444|11|30|123 — 🇺🇸 US
+378282246310005|08|29|4567 — 🇬🇧 GB
+6011111111111117|02|28|999 — 🇮🇳 IN
+3530111333300000|05|33|123 — 🇦🇪 AE
+5105105105105100|12|31|999 — 🇦🇪 AE
 
-# --- EMAIL COMBOS ---
-alice.johnson@gmail.com:Tr0ub4dor&3
-bob.smith@outlook.com:Hunter2!x
-carol@company.org:Passw0rd@2026
-dave@yahoo.com:MyP@ssw0rd99
-test123@mailinator.com:whatever123
-user1@tempmail.com:qwerty123
-throwaway@10minutemail.com:abc12345
-not-an-email:somepass
-bad@@domain.com:pass123
-user@gmail:password
-legit@protonmail.com:123456
-maria@gmail.com:password
+# --- EMAIL COMBOS (domain filter demo) ---
+alice.johnson@gmail.com:Tr0ub4dor&3 — 🇺🇸 US
+bob.smith@outlook.com:Hunter2!x — 🇬🇧 GB
+carol@company.org:Passw0rd@2026 — 🇦🇪 AE
+dave@yahoo.com:MyP@ssw0rd99 — 🇮🇳 IN
+maria@gmail.com:password — 🇦🇪 AE
 
-# --- PHONE COMBOS ---
-+14155552671:Str0ngPass!
-+447700900123:S3cure@Pass
-+919876543210:India#2026
-+14155552671:123456
-+447700900123:letmein
+# --- PHONE COMBOS (country-code filter demo) ---
++14155552671:Str0ngPass! — 🇺🇸 US
++447700900123:S3cure@Pass — 🇬🇧 GB
++919876543210:India#2026 — 🇮🇳 IN
++971501234567:DubaiPass1 — 🇦🇪 AE
 
-# --- JUNK (should be skipped) ---
+# --- JUNK (auto-skipped) ---
 https://example.com
 admin, [12/08/2026 14:00] some telegram header
