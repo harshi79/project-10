@@ -58,7 +58,7 @@ with a clear message.
 
 ---
 
-## Running the bot
+## Running the bot (locally)
 
 1. Install dependencies:
 
@@ -73,9 +73,51 @@ with a clear message.
    python main.py
    ```
 
-   For a hosted setup you can also set `WEBHOOK_URL` and `PORT`.
+   The bot runs in **polling mode** (no webhook) by default. It also starts a
+   tiny health server at `http://localhost:8080/health` (change `PORT` if needed).
 
 3. Send the bot any `.txt` file, then tap the buttons to filter and export.
+
+---
+
+## Deploy on Render (free, 24/7)
+
+The bot runs in **polling mode** (no webhook needed) and ships a lightweight
+`/health` HTTP server so Render and UptimeRobot can keep it awake. A
+`Dockerfile` and `render.yaml` are included.
+
+### Option A — Blueprint (easiest, one click)
+
+1. Push this repo to GitHub.
+2. Render → **New + → Blueprint** → pick the repo.
+3. Render creates the service from `render.yaml`.
+4. In the service → **Environment**, set:
+   - `TELEGRAM_BOT_TOKEN` = your bot token
+   - `WEBHOOK_URL` = leave empty (this keeps **polling mode**)
+5. Deploy. The bot stays online even after you close your laptop.
+
+### Option B — Manual
+
+1. Render → **New + → Web Service** → connect your GitHub repo.
+2. Runtime: **Docker**. (It auto-detects the `Dockerfile`.)
+3. **Health Check Path**: `/health`
+4. Env vars: `TELEGRAM_BOT_TOKEN` (your token). Leave `WEBHOOK_URL` empty.
+5. Deploy.
+
+### Keep it awake with UptimeRobot (free)
+
+Render's free tier sleeps after ~15 minutes without HTTP traffic. Fix it for
+free:
+
+1. Copy your Render service URL, e.g. `https://yori-prime-bot.onrender.com`.
+2. Go to [UptimeRobot](https://uptimerobot.com) → **New monitor**.
+3. Type: **HTTP(s)**, URL: `https://yori-prime-bot.onrender.com/health`,
+   interval **5 minutes**.
+4. UptimeRobot pings `/health` every 5 min → the service never sleeps.
+
+> ℹ️ **Note on stats:** the SQLite stats file (`data.db`) lives on Render's
+> ephemeral disk, so stats reset when Render redeploys. The bot itself keeps
+> working fine — only counters reset.
 
 ### Commands
 
@@ -98,7 +140,9 @@ with a clear message.
 ## Project layout
 
 ```
-main.py          Telegram bot (parse → clean → filter → export)
+main.py          Telegram bot (parse → clean → filter → export) + /health server
+Dockerfile       Container image (polling mode, health check)
+render.yaml      Render Blueprint (one-click deploy)
 sample.txt       Fake/test data covering every supported type
 requirements.txt
 ```

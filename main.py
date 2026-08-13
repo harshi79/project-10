@@ -72,17 +72,33 @@ file_queue: list[dict] = []
 queue_lock = threading.Lock()
 
 # ── Health server ───────────────────────────────────────────────────────────────
+# A tiny, dependency-free HTTP server used by Render's health check and by
+# UptimeRobot to keep the (free) service awake. It runs alongside the bot's
+# polling loop on the same $PORT.
+
+HEALTH_BODY = b"OK - Yori Prime Bot is alive\n"
+
 
 class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/health", "/healthz"):
+    def _respond(self):
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/health", "/healthz"):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(HEALTH_BODY)))
             self.end_headers()
-            self.wfile.write(b"OK - Yori Prime Bot is alive")
+            if self.command != "HEAD":
+                self.wfile.write(HEALTH_BODY)
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
+
+    def do_GET(self):
+        self._respond()
+
+    def do_HEAD(self):
+        self._respond()
 
     def log_message(self, *a):
         pass
@@ -90,9 +106,11 @@ class _Health(BaseHTTPRequestHandler):
 
 def _start_health():
     try:
-        HTTPServer(("", PORT), _Health).serve_forever()
-    except OSError:
-        pass
+        server = HTTPServer(("0.0.0.0", PORT), _Health)
+        log.info("Health server listening on http://0.0.0.0:%d/health", PORT)
+        server.serve_forever()
+    except OSError as e:
+        log.warning("Health server could not bind port %d: %s", PORT, e)
 
 # ── Database ────────────────────────────────────────────────────────────────────
 
@@ -1470,6 +1488,7 @@ def main() -> None:
     log.info("Bot starting on port %d", PORT)
 
     if WEBHOOK_URL:
+        log.info("Run mode: WEBHOOK")
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -1477,6 +1496,7 @@ def main() -> None:
             drop_pending_updates=True,
         )
     else:
+        log.info("Run mode: POLLING (Render-ready — leave WEBHOOK_URL unset)")
         app.run_polling(drop_pending_updates=True)
 
 
