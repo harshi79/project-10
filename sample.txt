@@ -24,6 +24,25 @@ maria@gmail.com:password — 🇦🇪 AE
 +919876543210:India#2026 — 🇮🇳 IN
 +971501234567:DubaiPass1 — 🇦🇪 AE
 
+# --- PROXIES (protocol + port filter demo) ---
+1.2.3.4:8080 — 🇺🇸 US
+5.6.7.8:3128 — 🇬🇧 GB
+socks5://10.0.0.1:1080 — 🇮🇳 IN
+http://user:pass@11.22.33.44:8080 — 🇦🇪 AE
+socks4://99.88.77.66:4145
+host.example.com:8080 — 🇺🇸 US
+
+# --- URLS (domain filter demo) ---
+https://example.com/page1
+https://example.com/page2
+https://news.site.co/article — 🇬🇧 GB
+
+# --- CRYPTO (network filter demo) ---
+0x52908400098527886E0F7030069857D2E4169EE7
+bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh
+1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2
+
 # --- JUNK (auto-skipped) ---
-https://example.com
+tg://resolve?domain=yorichiiprime
+t.me/yorichiiprime
 admin, [12/08/2026 14:00] some telegram header

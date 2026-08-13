@@ -1,21 +1,21 @@
 """
-Yori Cleaner Bot — Telegram advanced filtering bot.
+Yori Prime Cleaner Bot — super advanced .txt filtering bot.
 
-Parses .txt files of cards / email combos / phone combos (mixed files too),
-cleans them, deduplicates, and lets you FILTER the output:
+Reads almost any .txt file, auto-detects each line's type, cleans it,
+deduplicates, and lets you filter the output by many criteria:
 
-  • Type filter      — Cards / Emails / Phones / All
-  • Brand filter     — card brand from BIN (Visa, Mastercard, Amex, …)
-  • Country filter   — country tag at end of line (e.g. "… — 🇦🇪 AE")
-  • Phone code filter— country code (e.g. +91, +1, +44)
-  • Domain filter    — email domain + sort by domain
-  • Junk removal     — URLs, telegram headers, comments, blank lines
-  • Deduplication    — exact + case-insensitive duplicates
+  TYPES     : Cards, Email combos, Phone combos, Proxies, URLs, Crypto
+  FILTERS   : Brand (card BIN) · Country tag · Phone code · Proxy protocol
+              Proxy port · Crypto network · Domain · Sort by domain
+  CLEANING  : junk removal (URLs, tg headers, # comments, blanks), dedupe
+  OUTPUT    : TXT / CSV / Excel (.xlsx) with summary + per-type sheets
 
-Output: TXT, CSV, Excel (.xlsx)
+Upload limit: 20 MB (Telegram bot download limit).
 
 All data used is fake/test data — this is an educational project about how
-filtering works, nothing else. No account or card is ever contacted.
+filtering works, nothing else. No account or service is ever contacted.
+
+Owner: https://t.me/yorichiiprime
 """
 
 import os
@@ -50,12 +50,18 @@ from openpyxl.styles import Font, PatternFill, Alignment
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 
-TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-OWNER_ID    = 7728424218
-WATERMARK   = "\n\n— @yorifederation"
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-PORT        = int(os.environ.get("PORT", 8080))
-DB_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+OWNER_ID     = 7728424218
+BRAND_URL    = "https://t.me/yorichiiprime"
+BRAND_HANDLE = "@yorichiiprime"
+BRAND_NAME   = "Yori Prime"
+MAX_FILE_MB  = 20                          # Telegram bot download limit
+MAX_BYTES    = MAX_FILE_MB * 1024 * 1024
+WATERMARK    = f"\n\n— {BRAND_NAME}\n👑 Owner: {BRAND_HANDLE}\n{BRAND_URL}"
+FOOTER       = f"— {BRAND_NAME}\n👑 Owner: {BRAND_URL}"
+WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "")
+PORT         = int(os.environ.get("PORT", 8080))
+DB_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -73,7 +79,7 @@ class _Health(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"OK - Yori Bot is alive")
+            self.wfile.write(b"OK - Yori Prime Bot is alive")
         else:
             self.send_response(404)
             self.end_headers()
@@ -107,6 +113,9 @@ def init_db() -> None:
                 lines     INTEGER DEFAULT 0,
                 cards     INTEGER DEFAULT 0,
                 combos    INTEGER DEFAULT 0,
+                proxies   INTEGER DEFAULT 0,
+                urls      INTEGER DEFAULT 0,
+                cryptos   INTEGER DEFAULT 0,
                 last_seen TEXT    DEFAULT ''
             )
         """)
@@ -119,15 +128,25 @@ def init_db() -> None:
                 ts       TEXT
             )
         """)
+        # Migrate DBs created before the extra columns existed
+        cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
+        for col in ("proxies", "urls", "cryptos"):
+            if col not in cols:
+                c.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0")
 
 
-def upsert_user(uid: int, name: str, username: str, n_cards: int, n_combos: int) -> None:
-    total = n_cards + n_combos
+def upsert_user(uid: int, name: str, username: str, counts: dict) -> None:
+    n_cards   = counts.get("cards", 0)
+    n_combos  = counts.get("emails", 0) + counts.get("phones", 0)
+    n_proxies = counts.get("proxies", 0)
+    n_urls    = counts.get("urls", 0)
+    n_cryptos = counts.get("cryptos", 0)
+    total = n_cards + n_combos + n_proxies + n_urls + n_cryptos
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     with _conn() as c:
         c.execute("""
-            INSERT INTO users (id, name, username, files, lines, cards, combos, last_seen)
-            VALUES (?,?,?,1,?,?,?,?)
+            INSERT INTO users (id, name, username, files, lines, cards, combos, proxies, urls, cryptos, last_seen)
+            VALUES (?,?,?,1,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 name      = excluded.name,
                 username  = excluded.username,
@@ -135,8 +154,11 @@ def upsert_user(uid: int, name: str, username: str, n_cards: int, n_combos: int)
                 lines     = lines  + excluded.lines,
                 cards     = cards  + excluded.cards,
                 combos    = combos + excluded.combos,
+                proxies   = proxies + excluded.proxies,
+                urls      = urls   + excluded.urls,
+                cryptos   = cryptos + excluded.cryptos,
                 last_seen = excluded.last_seen
-        """, (uid, name, username, total, n_cards, n_combos, ts))
+        """, (uid, name, username, total, n_cards, n_combos, n_proxies, n_urls, n_cryptos, ts))
 
 
 def get_user(uid: int):
@@ -186,16 +208,21 @@ EMAIL_SEP_RE   = re.compile(r"^([^\s@:;|]+@[^\s@:;|]+\.[^\s@:;|]{2,})[:;|](.+)$"
 EMAIL_SPACE_RE = re.compile(r"^([^\s@]+@[^\s@]+\.[^\s@]{2,})\s+(\S+)$")
 PHONE_SEP_RE   = re.compile(r"^(\+\d{7,15}|\d{7,12})[:;|](.+)$")
 PHONE_SPACE_RE = re.compile(r"^(\+\d{7,15})\s+(\S+)$")
-JUNK_RE        = re.compile(r"^(https?://|tg://|t\.me/)", re.I)
+URL_RE         = re.compile(r"^https?://\S+$", re.I)
 TG_HEAD_RE     = re.compile(r"^.{1,80},\s*\[\d{1,2}/\d{1,2}/\d{4}")
+# Telegram-only links are junk; real http(s) links are a data type now.
+JUNK_RE        = re.compile(r"^(tg://|t\.me/)", re.I)
+
+ETH_RE  = re.compile(r"^0x[a-fA-F0-9]{40}$")
+BTC_BECH32_RE = re.compile(r"^bc1[a-zA-Z0-9]{25,59}$")
+BTC_BASE58_RE = re.compile(r"^[13][1-9A-HJ-NP-Za-km-z]{25,34}$")
 
 # Country tag at the end of a line: "… — 🇦🇪 AE"  (flag optional)
 COUNTRY_RE = re.compile(
     r"[\u2014\u2013\-]\s*(?:[\U0001F1E6-\U0001F1FF]{2}\s*)?([A-Za-z]{2})\s*$"
 )
 
-# Common ITU country calling codes (E.164). Used for longest-prefix matching so
-# "+14155552671" → "+1" (US), "+919876543210" → "+91" (India), etc.
+# Common ITU country calling codes (E.164), longest-prefix matched.
 COUNTRY_CODES = {
     "1", "7", "20", "27", "30", "31", "32", "33", "34", "36", "39", "40",
     "41", "43", "44", "45", "46", "47", "48", "49", "51", "52", "53", "54",
@@ -220,7 +247,7 @@ COUNTRY_CODES = {
 }
 CODE_KEYS = sorted(COUNTRY_CODES, key=lambda c: (-len(c), -int(c)))
 
-# Brand detection from BIN (first digits) — used for FILTERING, not validation.
+# Brand detection from BIN (first digits) — used for FILTERING.
 BRAND_RULES = [
     ("Visa",             lambda n: n[0] == "4"),
     ("Mastercard",       lambda n: len(n) >= 2 and 51 <= int(n[:2]) <= 55),
@@ -244,7 +271,6 @@ def card_brand(number: str) -> str:
 
 
 def extract_country(raw: str):
-    """Return (country_code_or_None, line_without_tag)."""
     m = COUNTRY_RE.search(raw)
     if m:
         return m.group(1).upper(), raw[:m.start()].rstrip()
@@ -262,15 +288,69 @@ def phone_code(phone: str):
     return None
 
 
-def analyse_line(raw: str):
-    """Classify a single line.
+def _valid_ipv4(host: str) -> bool:
+    octets = host.split(".")
+    return (len(octets) == 4
+            and all(o.isdigit() and 0 <= int(o) <= 255 for o in octets))
 
-    Returns one of:
-      ("card",  num, mm, yy, cvv, country)
-      ("combo", email, pw, country)
-      ("phone", phone, pw, country, code)
-      None
+
+def parse_proxy(t: str):
+    """Parse proxy line into a dict, or None.
+
+    Supports: host:port, scheme://host:port, scheme://user:pass@host:port,
+    host:port:user:pass, host:port|user|pass.
     """
+    s = t.strip()
+    protocol = None
+    m = re.match(r"^(http|https|socks4|socks5)://(.+)$", s, re.I)
+    if m:
+        protocol = m.group(1).lower()
+        s = m.group(2)
+    if "/" in s:          # has a path → it's a URL, not a proxy
+        return None
+
+    user = pw = None
+    if "@" in s:
+        cred, hostport = s.rsplit("@", 1)
+        if ":" in cred:
+            user, pw = cred.split(":", 1)
+        else:
+            return None
+        s = hostport
+
+    parts = re.split(r"[:\|]", s)
+    if len(parts) < 2:
+        return None
+    host, port_s = parts[0], parts[1]
+    if not host or not port_s.isdigit():
+        return None
+    port = int(port_s)
+    if not (1 <= port <= 65535):
+        return None
+
+    extra = parts[2:]
+    if extra:
+        if user is None:
+            user = extra[0]
+        if len(extra) >= 2 and pw is None:
+            pw = extra[1]
+
+    if _valid_ipv4(host):
+        host_type = "ip"
+    elif re.fullmatch(r"[a-zA-Z0-9.\-]+", host) and "." in host:
+        host_type = "host"
+    else:
+        return None
+
+    return {
+        "host": host, "port": port,
+        "protocol": protocol or "unknown",
+        "user": user, "pw": pw, "host_type": host_type,
+    }
+
+
+def analyse_line(raw: str):
+    """Classify one line. Returns a tuple tagged with the type, or None."""
     t = raw.strip()
     if not t or t.startswith("#"):
         return None
@@ -312,14 +392,29 @@ def analyse_line(raw: str):
         if pw:
             return ("phone", phone, pw, country, phone_code(phone))
 
+    p = parse_proxy(t)
+    if p:
+        p["country"] = country
+        return ("proxy", p)
+
+    if URL_RE.match(t):
+        host = re.sub(r"^https?://", "", t, flags=re.I).split("/")[0].split(":")[0].lower()
+        return ("url", t, host, country)
+
+    if ETH_RE.match(t):
+        return ("crypto", t, "ETH", country)
+    if BTC_BECH32_RE.match(t) or BTC_BASE58_RE.match(t):
+        return ("crypto", t, "BTC", country)
+
     return None
 
 
 def analyse_file(content: str) -> dict:
-    cards:  list[dict] = []
-    combos: list[dict] = []
-    phones: list[dict] = []
-    seen_cards, seen_combos, seen_phones = set(), set(), set()
+    buckets = {
+        "cards": [], "combos": [], "phones": [],
+        "proxies": [], "urls": [], "cryptos": [],
+    }
+    seen = {k: set() for k in buckets}
     skipped = 0
     total_nonempty = sum(
         1 for l in content.splitlines()
@@ -333,88 +428,133 @@ def analyse_file(content: str) -> dict:
                 skipped += 1
             continue
 
-        if r[0] == "card":
+        kind = r[0]
+
+        if kind == "card":
             _, num, mm, yy, cvv, country = r
             value = f"{num}|{mm}|{yy}|{cvv}"
-            if value in seen_cards:
+            if value in seen["cards"]:
                 skipped += 1
                 continue
-            seen_cards.add(value)
-            cards.append({
+            seen["cards"].add(value)
+            buckets["cards"].append({
                 "value": value, "num": num, "mm": mm, "yy": yy, "cvv": cvv,
                 "brand": card_brand(num), "country": country,
             })
 
-        elif r[0] == "combo":
+        elif kind == "combo":
             _, email, pw, country = r
             key = f"{email.lower()}:::{pw}"
-            if key in seen_combos:
+            if key in seen["combos"]:
                 skipped += 1
                 continue
-            seen_combos.add(key)
-            combos.append({
+            seen["combos"].add(key)
+            buckets["combos"].append({
                 "email": email, "pw": pw,
                 "domain": email.rsplit("@", 1)[-1].lower(), "country": country,
             })
 
-        elif r[0] == "phone":
+        elif kind == "phone":
             _, phone, pw, country, code = r
             key = f"{phone}:::{pw}"
-            if key in seen_phones:
+            if key in seen["phones"]:
                 skipped += 1
                 continue
-            seen_phones.add(key)
-            phones.append({
+            seen["phones"].add(key)
+            buckets["phones"].append({
                 "phone": phone, "pw": pw, "code": code, "country": country,
             })
 
-    return {
-        "cards": cards, "combos": combos, "phones": phones,
-        "skipped": skipped, "total": total_nonempty,
-    }
+        elif kind == "proxy":
+            p = r[1]
+            key = f"{p['host']}:{p['port']}:{p['user']}:{p['pw']}:{p['protocol']}"
+            if key in seen["proxies"]:
+                skipped += 1
+                continue
+            seen["proxies"].add(key)
+            buckets["proxies"].append(p)
+
+        elif kind == "url":
+            _, url, host, country = r
+            if url in seen["urls"]:
+                skipped += 1
+                continue
+            seen["urls"].add(url)
+            buckets["urls"].append({"url": url, "domain": host, "country": country})
+
+        elif kind == "crypto":
+            _, addr, net, country = r
+            if addr in seen["cryptos"]:
+                skipped += 1
+                continue
+            seen["cryptos"].add(addr)
+            buckets["cryptos"].append({"address": addr, "network": net, "country": country})
+
+    return {**buckets, "skipped": skipped, "total": total_nonempty}
 
 
 # ── Filter helpers ──────────────────────────────────────────────────────────────
 
-def get_domains(combos: list[dict]) -> list[str]:
+def _domain_stats(combos: list, urls: list) -> dict:
     counts: dict[str, int] = defaultdict(int)
     for c in combos:
         counts[c["domain"]] += 1
+    for u in urls:
+        counts[u["domain"]] += 1
+    return counts
+
+
+def get_domains(combos: list, urls: list) -> list[str]:
+    counts = _domain_stats(combos, urls)
     return sorted(counts.keys(), key=lambda d: (-counts[d], d))
 
 
-def sort_combos_by_domain(combos: list[dict]) -> list[dict]:
+def sort_combos_by_domain(combos: list) -> list:
     return sorted(combos, key=lambda c: (c["domain"], c["email"].lower()))
 
 
-def filter_combos_by_domain(combos: list[dict], domain: str) -> list[dict]:
-    return [c for c in combos if c["domain"] == domain.lower()]
+def sort_urls_by_domain(urls: list) -> list:
+    return sorted(urls, key=lambda u: (u["domain"], u["url"].lower()))
 
 
-def get_available_brands(cards: list[dict]) -> list[str]:
+def filter_by_domain(combos: list, urls: list, domain: str):
+    if not domain:
+        return combos, urls
+    d = domain.lower()
+    return ([c for c in combos if c["domain"] == d],
+            [u for u in urls if u["domain"] == d])
+
+
+def get_available_brands(cards: list) -> list:
     return sorted({c["brand"] for c in cards})
 
 
-def get_available_countries(cards: list[dict], combos: list[dict], phones: list[dict]) -> list[str]:
+def get_available_countries(*groups) -> list:
     codes = set()
-    for c in cards:
-        if c.get("country"):
-            codes.add(c["country"])
-    for c in combos:
-        if c.get("country"):
-            codes.add(c["country"])
-    for c in phones:
-        if c.get("country"):
-            codes.add(c["country"])
+    for g in groups:
+        for e in g:
+            if e.get("country"):
+                codes.add(e["country"])
     return sorted(codes)
 
 
-def get_available_codes(phones: list[dict]) -> list[str]:
+def get_available_codes(phones: list) -> list:
     return sorted({c["code"] for c in phones if c.get("code")})
 
 
-def next_choice(current, options: list[str]):
-    """Cycle through [None(All), *options]."""
+def get_available_protocols(proxies: list) -> list:
+    return sorted({p["protocol"] for p in proxies if p.get("protocol") != "unknown"})
+
+
+def get_available_ports(proxies: list) -> list:
+    return sorted({p["port"] for p in proxies})
+
+
+def get_available_networks(cryptos: list) -> list:
+    return sorted({c["network"] for c in cryptos})
+
+
+def next_choice(current, options: list):
     seq = [None] + list(options)
     try:
         i = seq.index(current)
@@ -425,26 +565,35 @@ def next_choice(current, options: list[str]):
 
 # ── Output Builders ─────────────────────────────────────────────────────────────
 
-def build_txt(cards: list, combos: list, phones: list) -> str:
+def proxy_str(p: dict) -> str:
+    auth = f"{p['user']}:{p['pw']}@" if p.get("user") else ""
+    if p.get("protocol") and p["protocol"] != "unknown":
+        return f"{p['protocol']}://{auth}{p['host']}:{p['port']}"
+    return f"{auth}{p['host']}:{p['port']}"
+
+
+def build_txt(cards, combos, phones, proxies, urls, cryptos) -> str:
+    groups = [
+        ("CARDS", cards, lambda c: c["value"]),
+        ("COMBOS", combos, lambda c: f"{c['email']}   {c['pw']}"),
+        ("PHONES", phones, lambda c: f"{c['phone']}   {c['pw']}"),
+        ("PROXIES", proxies, proxy_str),
+        ("URLS", urls, lambda u: u["url"]),
+        ("CRYPTO", cryptos, lambda c: c["address"]),
+    ]
+    present = [(n, g, f) for n, g, f in groups if g]
+    if not present:
+        return ""
+    if len(present) == 1:
+        name, g, fmt = present[0]
+        return "\n".join(fmt(x) for x in g) + WATERMARK
     parts: list[str] = []
-    sections = sum([bool(cards), bool(combos), bool(phones)])
-    if sections > 1:
-        if cards:
-            parts += [f"━━━ CARDS ({len(cards)}) ━━━", *[c["value"] for c in cards], ""]
-        if combos:
-            parts += [f"━━━ COMBOS ({len(combos)}) ━━━",
-                      *[f"{c['email']}   {c['pw']}" for c in combos], ""]
-        if phones:
-            parts += [f"━━━ PHONES ({len(phones)}) ━━━",
-                      *[f"{c['phone']}   {c['pw']}" for c in phones]]
-    else:
-        parts += ([c["value"] for c in cards]
-                  or [f"{c['email']}   {c['pw']}" for c in combos]
-                  or [f"{c['phone']}   {c['pw']}" for c in phones])
-    return "\n".join(parts) + WATERMARK
+    for name, g, fmt in present:
+        parts += [f"━━━ {name} ({len(g)}) ━━━", *[fmt(x) for x in g], ""]
+    return "\n".join(parts).rstrip("\n") + WATERMARK
 
 
-def build_csv(cards: list, combos: list, phones: list) -> str:
+def build_csv(cards, combos, phones, proxies, urls, cryptos) -> str:
     rows: list[list] = []
     if cards:
         rows.append(["Type", "Number", "Month", "Year", "CVV", "Brand", "Country"])
@@ -459,6 +608,20 @@ def build_csv(cards: list, combos: list, phones: list) -> str:
         rows.append(["Type", "Phone", "Password", "Code", "Country"])
         for c in phones:
             rows.append(["phone", c["phone"], c["pw"], c.get("code") or "", c.get("country") or ""])
+    if proxies:
+        rows.append(["Type", "Host", "Port", "Protocol", "User", "Pass", "HostType", "Country"])
+        for p in proxies:
+            rows.append(["proxy", p["host"], p["port"], p["protocol"],
+                         p["user"] or "", p["pw"] or "", p["host_type"],
+                         p.get("country") or ""])
+    if urls:
+        rows.append(["Type", "URL", "Domain", "Country"])
+        for u in urls:
+            rows.append(["url", u["url"], u["domain"], u.get("country") or ""])
+    if cryptos:
+        rows.append(["Type", "Address", "Network", "Country"])
+        for c in cryptos:
+            rows.append(["crypto", c["address"], c["network"], c.get("country") or ""])
     buf = StringIO()
     _csv.writer(buf).writerows(rows)
     return buf.getvalue()
@@ -482,42 +645,62 @@ def _write_table(ws, headers: list, rows: list) -> None:
         ws.column_dimensions[letter].width = min(max(m + 2, 8), 42)
 
 
-def _write_summary_sheet(ws, cards: list, combos: list, phones: list) -> None:
-    ws.append(["Yori Cleaner — Filtered Output"])
+def _write_summary_sheet(ws, groups: dict) -> None:
+    ws.append([f"{BRAND_NAME} — Filtered Output"])
     ws.append(["Generated", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")])
     ws.append([])
     ws.append(["Type", "Total"])
     for cell in ws[4]:
         _style_header(cell)
-    for name, entries in (("Cards", cards), ("Emails", combos), ("Phones", phones)):
+    for name, entries in groups.items():
         ws.append([name, len(entries)])
-    for letter, width in (("A", 12), ("B", 10)):
-        ws.column_dimensions[letter].width = width
+    ws.append([])
+    ws.append(["Owner", BRAND_URL])
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 40
 
 
-def build_xlsx(cards: list, combos: list, phones: list) -> bytes:
+def build_xlsx(cards, combos, phones, proxies, urls, cryptos) -> bytes:
     wb = Workbook()
-
     ws = wb.active
     ws.title = "Summary"
-    _write_summary_sheet(ws, cards, combos, phones)
+    _write_summary_sheet(ws, {
+        "Cards": cards, "Emails": combos, "Phones": phones,
+        "Proxies": proxies, "URLs": urls, "Crypto": cryptos,
+    })
 
     if cards:
-        ws_c = wb.create_sheet("Cards")
-        _write_table(ws_c,
+        s = wb.create_sheet("Cards")
+        _write_table(s,
                      ["Number", "Month", "Year", "CVV", "Brand", "Country"],
                      [[c["num"], c["mm"], c["yy"], c["cvv"], c["brand"],
                        c.get("country") or ""] for c in cards])
     if combos:
-        ws_e = wb.create_sheet("Emails")
-        _write_table(ws_e,
+        s = wb.create_sheet("Emails")
+        _write_table(s,
                      ["Email", "Password", "Domain", "Country"],
                      [[c["email"], c["pw"], c["domain"], c.get("country") or ""] for c in combos])
     if phones:
-        ws_p = wb.create_sheet("Phones")
-        _write_table(ws_p,
+        s = wb.create_sheet("Phones")
+        _write_table(s,
                      ["Phone", "Password", "Code", "Country"],
                      [[c["phone"], c["pw"], c.get("code") or "", c.get("country") or ""] for c in phones])
+    if proxies:
+        s = wb.create_sheet("Proxies")
+        _write_table(s,
+                     ["Host", "Port", "Protocol", "User", "Pass", "HostType", "Country"],
+                     [[p["host"], p["port"], p["protocol"], p["user"] or "", p["pw"] or "",
+                       p["host_type"], p.get("country") or ""] for p in proxies])
+    if urls:
+        s = wb.create_sheet("URLs")
+        _write_table(s,
+                     ["URL", "Domain", "Country"],
+                     [[u["url"], u["domain"], u.get("country") or ""] for u in urls])
+    if cryptos:
+        s = wb.create_sheet("Crypto")
+        _write_table(s,
+                     ["Address", "Network", "Country"],
+                     [[c["address"], c["network"], c.get("country") or ""] for c in cryptos])
 
     buf = BytesIO()
     wb.save(buf)
@@ -526,16 +709,23 @@ def build_xlsx(cards: list, combos: list, phones: list) -> bytes:
 
 # ── Keyboards ───────────────────────────────────────────────────────────────────
 
+OWNER_BUTTON = InlineKeyboardButton("👑 Owner", url=BRAND_URL)
+
 MAIN_KB = ReplyKeyboardMarkup(
     [["📊 My Stats", "ℹ️ Help"], ["🏷️ About"]],
     resize_keyboard=True, is_persistent=True,
 )
 
 
-def type_ikb(cards: list, combos: list, phones: list, uid: int, fmt: str = "txt",
+def _chunk(row: list, size: int = 4) -> list:
+    return [row[i:i + size] for i in range(0, len(row), size)]
+
+
+def type_ikb(cards, combos, phones, proxies, urls, cryptos, uid: int, fmt: str = "txt",
              selected_types: set | None = None, domain: str | None = None,
-             sort: bool = False, brand: str | None = None,
-             country: str | None = None, code: str | None = None) -> InlineKeyboardMarkup:
+             sort: bool = False, brand: str | None = None, country: str | None = None,
+             code: str | None = None, protocol: str | None = None,
+             port: int | None = None, network: str | None = None) -> InlineKeyboardMarkup:
     rows = []
     sel = selected_types or set()
 
@@ -548,39 +738,51 @@ def type_ikb(cards: list, combos: list, phones: list, uid: int, fmt: str = "txt"
 
     # Row 2: Type selection
     type_row = []
-    if cards:
-        type_row.append(InlineKeyboardButton(
-            f"💳 Cards {'✅' if 'cards' in sel else ''}", callback_data=f"sel:cards:{uid}"))
-    if combos:
-        type_row.append(InlineKeyboardButton(
-            f"🔑 Emails {'✅' if 'combos' in sel else ''}", callback_data=f"sel:combos:{uid}"))
-    if phones:
-        type_row.append(InlineKeyboardButton(
-            f"📱 Phones {'✅' if 'phones' in sel else ''}", callback_data=f"sel:phones:{uid}"))
+    for key, label, cb in (
+        ("cards", "💳 Cards", f"sel:cards:{uid}"),
+        ("combos", "🔑 Emails", f"sel:combos:{uid}"),
+        ("phones", "📱 Phones", f"sel:phones:{uid}"),
+        ("proxies", "🌐 Proxies", f"sel:proxies:{uid}"),
+        ("urls", "🔗 URLs", f"sel:urls:{uid}"),
+        ("cryptos", "💰 Crypto", f"sel:cryptos:{uid}"),
+    ):
+        present = bool({"cards": cards, "combos": combos, "phones": phones,
+                        "proxies": proxies, "urls": urls, "cryptos": cryptos}[key])
+        if present:
+            type_row.append(InlineKeyboardButton(
+                f"{label} {'✅' if key in sel else ''}", callback_data=cb))
     if len(type_row) > 1:
         type_row.append(InlineKeyboardButton(
             f"🔀 All {'✅' if not sel else ''}", callback_data=f"sel:all:{uid}"))
     if type_row:
-        rows.append(type_row)
+        rows.extend(_chunk(type_row))
 
     # Row 3: Advanced filters (cycle buttons)
     filter_row = []
     if cards:
         filter_row.append(InlineKeyboardButton(
             f"💳 Brand: {brand or 'All'}", callback_data=f"brand:{uid}"))
-    countries = get_available_countries(cards, combos, phones)
+    countries = get_available_countries(cards, combos, phones, proxies, urls, cryptos)
     if countries:
         filter_row.append(InlineKeyboardButton(
             f"🌍 Country: {country or 'All'}", callback_data=f"cty:{uid}"))
     if phones:
         filter_row.append(InlineKeyboardButton(
             f"📞 Code: {code or 'All'}", callback_data=f"code:{uid}"))
+    if proxies:
+        filter_row.append(InlineKeyboardButton(
+            f"🌐 Protocol: {protocol or 'All'}", callback_data=f"proto:{uid}"))
+        filter_row.append(InlineKeyboardButton(
+            f"🔌 Port: {port or 'All'}", callback_data=f"port:{uid}"))
+    if cryptos:
+        filter_row.append(InlineKeyboardButton(
+            f"💰 Network: {network or 'All'}", callback_data=f"net:{uid}"))
     if filter_row:
-        rows.append(filter_row)
+        rows.extend(_chunk(filter_row))
 
-    # Row 4: Domain filter + sort
-    if combos:
-        domains = get_domains(combos)[:5]
+    # Row 4: Domain filter + sort (emails + urls)
+    if combos or urls:
+        domains = get_domains(combos, urls)[:5]
         if domains:
             rows.append([InlineKeyboardButton(
                 f"📧 {d} {'✅' if domain == d else ''}",
@@ -590,6 +792,7 @@ def type_ikb(cards: list, combos: list, phones: list, uid: int, fmt: str = "txt"
             callback_data=f"sels:domain:{uid}")])
 
     rows.append([InlineKeyboardButton("🚀 GENERATE", callback_data=f"gen:{fmt}:{uid}")])
+    rows.append([OWNER_BUTTON])
 
     return InlineKeyboardMarkup(rows)
 
@@ -601,6 +804,7 @@ def result_ikb(uid: int) -> InlineKeyboardMarkup:
     ]]
     if uid == OWNER_ID:
         rows.append([InlineKeyboardButton("👑 Global Stats", callback_data="owner:stats")])
+    rows.append([OWNER_BUTTON])
     return InlineKeyboardMarkup(rows)
 
 
@@ -609,42 +813,42 @@ def result_ikb(uid: int) -> InlineKeyboardMarkup:
 HELP_TEXT = (
     "<b>ℹ️ How to use</b>\n"
     "──────────────────\n"
-    "Send any <b>.txt</b> file. Every line is analysed and cleaned:\n\n"
-    "💳 <b>Cards</b> — any separator:\n"
-    "  <code>4111111111111111|05|33|496 — 🇦🇪 AE</code>\n"
-    "  <code>4111111111111111 05 33 496</code>\n\n"
-    "🔑 <b>Email combos</b>:\n"
-    "  <code>user@gmail.com:Password1</code>\n"
-    "  <code>user@gmail.com|Password1</code>\n\n"
-    "📱 <b>Phone combos</b>:\n"
-    "  <code>+12345678901:Password1</code>\n"
-    "  <code>12345678901:Password1</code>\n\n"
-    "🧰 <b>Filters (tap to cycle)</b>:\n"
-    "  💳 Brand — Visa / Mastercard / Amex / …\n"
-    "  🌍 Country — from the country tag at line end\n"
-    "  📞 Code — phone country code (+91, +1, +44 …)\n"
-    "  📧 Domain — email domain + sort by domain\n\n"
-    "🗑️ Junk (URLs, telegram headers, comments) is removed automatically.\n"
-    "📊 Choose output format: TXT / CSV / Excel\n\n"
-    "<i>— @yorifederation</i>"
+    "Send almost any <b>.txt</b> file (up to 20 MB). Every line is detected,\n"
+    "cleaned and deduplicated automatically.\n\n"
+    "🔍 <b>Supported types</b>\n"
+    "  💳 Cards — <code>4111111111111111|05|33|496 — 🇦🇪 AE</code>\n"
+    "  🔑 Emails — <code>user@gmail.com:Password1</code>\n"
+    "  📱 Phones — <code>+919876543210:Password1</code>\n"
+    "  🌐 Proxies — <code>1.2.3.4:8080</code> · <code>socks5://u:p@1.2.3.4:1080</code>\n"
+    "  🔗 URLs — <code>https://example.com/page</code>\n"
+    "  💰 Crypto — BTC / ETH addresses\n\n"
+    "🧰 <b>Filters (tap to cycle)</b>\n"
+    "  💳 Brand · 🌍 Country · 📞 Code · 🌐 Protocol · 🔌 Port · 💰 Network · 📧 Domain\n\n"
+    "🗑️ Junk (tg links, headers, comments) is removed automatically.\n"
+    "📊 Output: TXT / CSV / Excel\n\n"
+    f"👑 Owner: {BRAND_URL}\n"
+    f"<i>— {BRAND_NAME}</i>"
 )
 
 ABOUT_TEXT = (
-    "<b>🏷️ @yorifederation Cleaner + Filter Bot</b>\n"
+    f"<b>🏷️ {BRAND_NAME} Filter Bot</b>\n"
     "──────────────────\n"
-    "⚡ Instant .txt file analysis\n"
-    "🧠 Fuzzy per-line pattern detection\n"
+    "⚡ Instant .txt file analysis (up to 20 MB)\n"
+    "🧠 Auto-detect cards / emails / phones / proxies / URLs / crypto\n"
     "💳 Filter by card brand (BIN)\n"
     "🌍 Filter by country tag\n"
     "📞 Filter by phone country code\n"
-    "📧 Filter by email domain\n"
-    "🔀 Mixed files in one pass\n"
+    "🌐 Filter by proxy protocol\n"
+    "🔌 Filter by proxy port\n"
+    "💰 Filter by crypto network\n"
+    "📧 Filter by domain + sort\n"
     "🗑️ Automatic junk removal\n"
     "🔑 Deduplication built in\n"
     "📊 TXT / CSV / Excel output\n"
     "💧 Auto-watermark on every output\n"
     "📊 Per-user stats (SQLite)\n\n"
-    "<i>— @yorifederation</i>"
+    f"👑 Owner: {BRAND_URL}\n"
+    f"<i>— {BRAND_NAME}</i>"
 )
 
 
@@ -653,12 +857,16 @@ def user_stats_text(row) -> str:
         f"<b>📊 Your Stats</b>\n"
         f"──────────────────\n"
         f"👤 {row['name'] or 'Unknown'}  <i>{row['username']}</i>\n\n"
-        f"📁 Files cleaned  <b>{row['files']:,}</b>\n"
-        f"📝 Total lines    <b>{row['lines']:,}</b>\n"
-        f"💳 Card lines     <b>{row['cards']:,}</b>\n"
-        f"🔑 Combo lines    <b>{row['combos']:,}</b>\n\n"
+        f"📁 Files processed  <b>{row['files']:,}</b>\n"
+        f"📝 Total lines      <b>{row['lines']:,}</b>\n"
+        f"💳 Card lines       <b>{row['cards']:,}</b>\n"
+        f"🔑 Combo lines      <b>{row['combos']:,}</b>\n"
+        f"🌐 Proxy lines      <b>{row['proxies']:,}</b>\n"
+        f"🔗 URL lines        <b>{row['urls']:,}</b>\n"
+        f"💰 Crypto lines     <b>{row['cryptos']:,}</b>\n\n"
         f"🕒 <i>{row['last_seen']}</i>\n\n"
-        f"<i>— @yorifederation</i>"
+        f"👑 Owner: {BRAND_URL}\n"
+        f"<i>— {BRAND_NAME}</i>"
     )
 
 
@@ -675,7 +883,8 @@ def global_stats_text() -> str:
         f"📁 Total files   <b>{total_files:,}</b>\n"
         f"📝 Total lines   <b>{total_lines:,}</b>\n\n"
         f"🏆 <b>Top 5</b>\n{top_str}\n\n"
-        f"<i>— @yorifederation</i>"
+        f"👑 Owner: {BRAND_URL}\n"
+        f"<i>— {BRAND_NAME}</i>"
     )
 
 
@@ -684,19 +893,17 @@ def global_stats_text() -> str:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     name = update.effective_user.first_name or "there"
     await update.message.reply_text(
-        f"⚡ <b>Yori Cleaner</b>  <i>by @yorifederation</i>\n"
+        f"⚡ <b>{BRAND_NAME} Filter Bot</b>\n"
         f"──────────────────────\n\n"
         f"Welcome, <b>{name}</b>.\n\n"
-        f"Drop a <b>.txt</b> file and I will:\n"
-        f"  🧠 Analyse every line automatically\n"
-        f"  🗑️ Remove junk (URLs, headers, comments)\n"
+        f"Drop a <b>.txt</b> file (up to 20 MB) and I will:\n"
+        f"  🧠 Auto-detect every line's type\n"
+        f"  🗑️ Remove junk (tg links, headers, comments)\n"
         f"  🔑 Deduplicate entries\n"
-        f"  💳 Filter by card brand\n"
-        f"  🌍 Filter by country\n"
-        f"  📞 Filter by phone country code\n"
-        f"  📧 Filter by email domain\n"
+        f"  💳🌍📞🌐🔌💰📧 Apply advanced filters\n"
         f"  📊 Export TXT / CSV / Excel\n\n"
-        f"No commands needed — just send the file.",
+        f"No commands needed — just send the file.\n\n"
+        f"👑 Owner: {BRAND_URL}",
         parse_mode="HTML", reply_markup=MAIN_KB,
     )
 
@@ -774,6 +981,17 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    if doc.file_size and doc.file_size > MAX_BYTES:
+        mb = round(doc.file_size / 1024 / 1024, 1)
+        await update.message.reply_text(
+            f"❌ <b>File too large.</b>\n\n"
+            f"📁 {doc.file_name}: <b>{mb} MB</b>\n"
+            f"⛔ Maximum allowed: <b>{MAX_FILE_MB} MB</b> (Telegram bot download limit).\n\n"
+            f"Split the file into smaller parts and send again.",
+            parse_mode="HTML", reply_markup=MAIN_KB,
+        )
+        return
+
     with queue_lock:
         user_queued = sum(1 for q in file_queue if q["uid"] == uid)
     if user_queued >= 3:
@@ -792,18 +1010,30 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         tg_file = await ctx.bot.get_file(doc.file_id)
         async with aiohttp.ClientSession() as session:
             async with session.get(tg_file.file_path) as resp:
-                content = await resp.text(encoding="utf-8", errors="replace")
+                data = await resp.read()
+
+        if len(data) > MAX_BYTES:
+            await thinking.delete()
+            await update.message.reply_text(
+                f"❌ <b>File too large</b> — over {MAX_FILE_MB} MB after download.\n"
+                f"Split it into smaller parts.",
+                parse_mode="HTML", reply_markup=MAIN_KB,
+            )
+            return
+
+        content = data.decode("utf-8", errors="replace")
 
         result = analyse_file(content)
         cards, combos, phones = result["cards"], result["combos"], result["phones"]
+        proxies, urls, cryptos = result["proxies"], result["urls"], result["cryptos"]
         skipped, total = result["skipped"], result["total"]
 
         await thinking.delete()
 
-        if not cards and not combos and not phones:
+        if not any([cards, combos, phones, proxies, urls, cryptos]):
             await update.message.reply_text(
                 f"⚠️ <b>Nothing recognised</b> in <code>{doc.file_name}</code>.\n\n"
-                f"Supported: cards, email combos, phone combos, or any mix.",
+                f"Supported: cards, email combos, phone combos, proxies, URLs, crypto.",
                 parse_mode="HTML", reply_markup=MAIN_KB,
             )
             return
@@ -817,17 +1047,18 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 "uid": uid,
                 "filename": doc.file_name,
                 "base": base,
-                "cards": cards,
-                "combos": combos,
-                "phones": phones,
-                "skipped": skipped,
-                "total": total,
+                "cards": cards, "combos": combos, "phones": phones,
+                "proxies": proxies, "urls": urls, "cryptos": cryptos,
+                "skipped": skipped, "total": total,
                 "selected_types": set(),
                 "selected_format": "txt",
                 "selected_domain": None,
                 "selected_brand": None,
                 "selected_country": None,
                 "selected_code": None,
+                "selected_protocol": None,
+                "selected_port": None,
+                "selected_network": None,
                 "sort_by_domain": False,
                 "status": "analysed",
                 "user_name": full_name,
@@ -836,12 +1067,10 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             log_queue(uid, doc.file_name, "queued")
 
         type_parts = []
-        if cards:
-            type_parts.append(f"💳 <b>Cards:</b> {len(cards)}")
-        if combos:
-            type_parts.append(f"🔑 <b>Emails:</b> {len(combos)}")
-        if phones:
-            type_parts.append(f"📱 <b>Phones:</b> {len(phones)}")
+        for label, g in (("💳 Cards", cards), ("🔑 Emails", combos), ("📱 Phones", phones),
+                         ("🌐 Proxies", proxies), ("🔗 URLs", urls), ("💰 Crypto", cryptos)):
+            if g:
+                type_parts.append(f"{label}: <b>{len(g)}</b>")
         if skipped:
             type_parts.append(f"🗑️ <b>Skipped:</b> {skipped}")
 
@@ -852,7 +1081,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             + "\n".join(type_parts) + "\n\n"
             f"👇 <b>Apply filters & choose format:</b>",
             parse_mode="HTML",
-            reply_markup=type_ikb(cards, combos, phones, uid, "txt"),
+            reply_markup=type_ikb(cards, combos, phones, proxies, urls, cryptos, uid, "txt"),
         )
 
     except Exception:
@@ -869,9 +1098,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -> None:
     uid = queue_item["uid"]
-    cards = queue_item["cards"]
-    combos = queue_item["combos"]
-    phones = queue_item["phones"]
     base = queue_item["base"]
     fmt = queue_item.get("selected_format", "txt")
     selected_types = queue_item.get("selected_types", set())
@@ -879,51 +1105,63 @@ async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -
     brand = queue_item.get("selected_brand", None)
     country = queue_item.get("selected_country", None)
     code = queue_item.get("selected_code", None)
+    protocol = queue_item.get("selected_protocol", None)
+    port = queue_item.get("selected_port", None)
+    network = queue_item.get("selected_network", None)
     sort_by_domain = queue_item.get("sort_by_domain", False)
     user_name = queue_item.get("user_name", "")
     user_username = queue_item.get("user_username", "")
 
-    # Type filter
-    out_cards = cards if (not selected_types or "cards" in selected_types) else []
-    out_combos = combos if (not selected_types or "combos" in selected_types) else []
-    out_phones = phones if (not selected_types or "phones" in selected_types) else []
+    def pick(key):
+        return queue_item[key] if (not selected_types or key in selected_types) else []
 
-    # Brand filter
+    out_cards   = pick("cards")
+    out_combos  = pick("combos")
+    out_phones  = pick("phones")
+    out_proxies = pick("proxies")
+    out_urls    = pick("urls")
+    out_cryptos = pick("cryptos")
+
+    # Apply filters
     if brand and out_cards:
         out_cards = [c for c in out_cards if c["brand"] == brand]
-
-    # Country filter (applies to all types)
     if country:
-        out_cards = [c for c in out_cards if c.get("country") == country]
-        out_combos = [c for c in out_combos if c.get("country") == country]
-        out_phones = [c for c in out_phones if c.get("country") == country]
-
-    # Phone code filter
+        out_cards   = [c for c in out_cards if c.get("country") == country]
+        out_combos  = [c for c in out_combos if c.get("country") == country]
+        out_phones  = [c for c in out_phones if c.get("country") == country]
+        out_proxies = [c for c in out_proxies if c.get("country") == country]
+        out_urls    = [c for c in out_urls if c.get("country") == country]
+        out_cryptos = [c for c in out_cryptos if c.get("country") == country]
     if code and out_phones:
         out_phones = [c for c in out_phones if c.get("code") == code]
-
-    # Domain filter + sort
-    if domain and out_combos:
-        out_combos = filter_combos_by_domain(out_combos, domain)
-    if sort_by_domain and out_combos:
+    if protocol and out_proxies:
+        out_proxies = [p for p in out_proxies if p.get("protocol") == protocol]
+    if port and out_proxies:
+        out_proxies = [p for p in out_proxies if p.get("port") == port]
+    if network and out_cryptos:
+        out_cryptos = [c for c in out_cryptos if c.get("network") == network]
+    if domain:
+        out_combos, out_urls = filter_by_domain(out_combos, out_urls, domain)
+    if sort_by_domain:
         out_combos = sort_combos_by_domain(out_combos)
+        out_urls = sort_urls_by_domain(out_urls)
 
-    if not out_cards and not out_combos and not out_phones:
+    if not any([out_cards, out_combos, out_phones, out_proxies, out_urls, out_cryptos]):
         await ctx.bot.send_message(
             uid,
-            "⚠️ <b>No data left after filtering.</b>\nTry a different type, brand, country, code or domain.",
+            "⚠️ <b>No data left after filtering.</b>\nTry a different type or filter.",
             parse_mode="HTML",
         )
         return
 
     if fmt == "csv":
-        output = build_csv(out_cards, out_combos, out_phones)
+        output = build_csv(out_cards, out_combos, out_phones, out_proxies, out_urls, out_cryptos)
         ext = "csv"
     elif fmt == "xlsx":
-        output_bytes = build_xlsx(out_cards, out_combos, out_phones)
+        output_bytes = build_xlsx(out_cards, out_combos, out_phones, out_proxies, out_urls, out_cryptos)
         ext = "xlsx"
     else:
-        output = build_txt(out_cards, out_combos, out_phones)
+        output = build_txt(out_cards, out_combos, out_phones, out_proxies, out_urls, out_cryptos)
         ext = "txt"
 
     if fmt == "xlsx":
@@ -932,13 +1170,15 @@ async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -
         buf = BytesIO(output.encode("utf-8"))
     buf.name = f"{base}_filtered.{ext}"
 
-    parts = []
-    if out_cards:
-        parts.append(f"💳 Cards: {len(out_cards)}")
-    if out_combos:
-        parts.append(f"🔑 Emails: {len(out_combos)}")
-    if out_phones:
-        parts.append(f"📱 Phones: {len(out_phones)}")
+    parts = [
+        (f"💳 Cards: {len(out_cards)}", out_cards),
+        (f"🔑 Emails: {len(out_combos)}", out_combos),
+        (f"📱 Phones: {len(out_phones)}", out_phones),
+        (f"🌐 Proxies: {len(out_proxies)}", out_proxies),
+        (f"🔗 URLs: {len(out_urls)}", out_urls),
+        (f"💰 Crypto: {len(out_cryptos)}", out_cryptos),
+    ]
+    lines = [label for label, g in parts if g]
     filters_applied = []
     if brand:
         filters_applied.append(f"💳 {brand}")
@@ -946,19 +1186,25 @@ async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -
         filters_applied.append(f"🌍 {country}")
     if code:
         filters_applied.append(f"📞 {code}")
+    if protocol:
+        filters_applied.append(f"🌐 {protocol}")
+    if port:
+        filters_applied.append(f"🔌 {port}")
+    if network:
+        filters_applied.append(f"💰 {network}")
     if domain:
         filters_applied.append(f"📧 {domain}")
     if sort_by_domain:
         filters_applied.append("🔤 sorted")
     if filters_applied:
-        parts.append("🧰 " + " · ".join(filters_applied))
-    parts.append(f"📄 Format: {ext.upper()}")
+        lines.append("🧰 " + " · ".join(filters_applied))
+    lines.append(f"📄 Format: {ext.upper()}")
 
     caption = (
         f"✅ <b>Done!</b>\n"
         f"──────────────────\n"
-        + "\n".join(parts) + "\n\n"
-        + "<i>— @yorifederation</i>"
+        + "\n".join(lines) + "\n\n"
+        + FOOTER
     )
 
     try:
@@ -971,13 +1217,15 @@ async def process_queue_item(ctx: ContextTypes.DEFAULT_TYPE, queue_item: dict) -
             reply_markup=result_ikb(uid),
         )
 
-        upsert_user(uid, user_name, user_username,
-                    len(out_cards), len(out_combos) + len(out_phones))
+        upsert_user(uid, user_name, user_username, {
+            "cards": len(out_cards), "emails": len(out_combos), "phones": len(out_phones),
+            "proxies": len(out_proxies), "urls": len(out_urls), "cryptos": len(out_cryptos),
+        })
 
         log_queue(uid, queue_item["filename"], "done")
-        log.info("Processed %s uid=%s cards=%d combos=%d phones=%d fmt=%s",
-                 queue_item["filename"], uid, len(out_cards), len(out_combos),
-                 len(out_phones), fmt)
+        log.info("Processed %s uid=%s cards=%d combos=%d phones=%d proxies=%d urls=%d cryptos=%d fmt=%s",
+                 queue_item["filename"], uid, len(out_cards), len(out_combos), len(out_phones),
+                 len(out_proxies), len(out_urls), len(out_cryptos), fmt)
 
     except Exception as e:
         log.error("Error sending file to uid=%s: %s", uid, e)
@@ -999,14 +1247,21 @@ async def _refresh_keyboard(query, item: dict) -> None:
     try:
         await query.message.edit_reply_markup(
             reply_markup=type_ikb(
-                item["cards"], item["combos"], item["phones"], item["uid"],
+                item["cards"], item["combos"], item["phones"],
+                item["proxies"], item["urls"], item["cryptos"], item["uid"],
                 item["selected_format"], item["selected_types"],
                 item["selected_domain"], item["sort_by_domain"],
                 item["selected_brand"], item["selected_country"], item["selected_code"],
+                item["selected_protocol"], item["selected_port"], item["selected_network"],
             )
         )
     except BadRequest:
         pass
+
+
+def _cycle_filter(query, item, attr, options, label):
+    item[attr] = next_choice(item.get(attr), options)
+    return f"✅ {label}: {item[attr] or 'All'}"
 
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1067,30 +1322,62 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         if not item:
             await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
             return
-        options = get_available_brands(item["cards"])
-        item["selected_brand"] = next_choice(item.get("selected_brand"), options)
+        msg = _cycle_filter(query, item, "selected_brand",
+                            get_available_brands(item["cards"]), "Brand")
         await _refresh_keyboard(query, item)
-        await query.answer(f"✅ Brand: {item['selected_brand'] or 'All'}")
+        await query.answer(msg)
 
     elif data.startswith("cty:"):
         item = _get_user_queue_item(uid)
         if not item:
             await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
             return
-        options = get_available_countries(item["cards"], item["combos"], item["phones"])
-        item["selected_country"] = next_choice(item.get("selected_country"), options)
+        msg = _cycle_filter(query, item, "selected_country",
+                            get_available_countries(item["cards"], item["combos"], item["phones"],
+                                                    item["proxies"], item["urls"], item["cryptos"]),
+                            "Country")
         await _refresh_keyboard(query, item)
-        await query.answer(f"✅ Country: {item['selected_country'] or 'All'}")
+        await query.answer(msg)
 
     elif data.startswith("code:"):
         item = _get_user_queue_item(uid)
         if not item:
             await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
             return
-        options = get_available_codes(item["phones"])
-        item["selected_code"] = next_choice(item.get("selected_code"), options)
+        msg = _cycle_filter(query, item, "selected_code",
+                            get_available_codes(item["phones"]), "Code")
         await _refresh_keyboard(query, item)
-        await query.answer(f"✅ Code: {item['selected_code'] or 'All'}")
+        await query.answer(msg)
+
+    elif data.startswith("proto:"):
+        item = _get_user_queue_item(uid)
+        if not item:
+            await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+            return
+        msg = _cycle_filter(query, item, "selected_protocol",
+                            get_available_protocols(item["proxies"]), "Protocol")
+        await _refresh_keyboard(query, item)
+        await query.answer(msg)
+
+    elif data.startswith("port:"):
+        item = _get_user_queue_item(uid)
+        if not item:
+            await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+            return
+        msg = _cycle_filter(query, item, "selected_port",
+                            get_available_ports(item["proxies"]), "Port")
+        await _refresh_keyboard(query, item)
+        await query.answer(msg)
+
+    elif data.startswith("net:"):
+        item = _get_user_queue_item(uid)
+        if not item:
+            await query.answer("⏳ No pending file. Send a new file.", show_alert=True)
+            return
+        msg = _cycle_filter(query, item, "selected_network",
+                            get_available_networks(item["cryptos"]), "Network")
+        await _refresh_keyboard(query, item)
+        await query.answer(msg)
 
     elif data.startswith("seld:"):
         parts = data.split(":")

@@ -1,8 +1,8 @@
-# Yori Cleaner + Filter Bot
+# Yori Prime Filter Bot
 
-A Telegram bot that reads a `.txt` file of **cards**, **email combos** and
-**phone combos**, cleans them up, and lets you **filter** the output in many
-ways. Built as a cybersecurity-team school project.
+A Telegram bot that reads almost any `.txt` file, auto-detects each line's type,
+cleans it, deduplicates, and lets you **filter** the output in many ways. Built
+as a cybersecurity-team school project.
 
 > ⚠️ **Educational use only.** All data is fake/test data. The bot only
 > *parses, cleans and filters* text — it never contacts any bank, payment
@@ -10,35 +10,51 @@ ways. Built as a cybersecurity-team school project.
 
 ---
 
-## Features
+## Supported types (auto-detected)
 
-### 🧹 Cleaning
-- Auto-detects card / email-combo / phone-combo lines in **mixed files** in one pass
-- Removes junk automatically (URLs, telegram headers, `#` comments, blank lines)
-- **Deduplication** (exact + case-insensitive email dedupe)
-- Normalises card format to `number|month|year|cvv`
+| Type | Example |
+|------|---------|
+| 💳 Cards | `4111111111111111\|05\|33\|496 — 🇦🇪 AE` |
+| 🔑 Email combos | `user@gmail.com:Password1` |
+| 📱 Phone combos | `+919876543210:Password1` |
+| 🌐 Proxies | `1.2.3.4:8080` · `socks5://u:p@1.2.3.4:1080` · `host:port:user:pass` |
+| 🔗 URLs | `https://example.com/page` |
+| 💰 Crypto | BTC (`bc1…`, `1…`, `3…`) and ETH (`0x…`) addresses |
 
-### 🧰 Advanced filters
-| Filter | What it does |
-|--------|--------------|
-| 💳 Brand | Filter cards by brand detected from the BIN (Visa, Mastercard, Amex, Discover, JCB, UnionPay, Diners, Maestro) |
-| 🌍 Country | Filter by the country tag at the end of a line (`… — 🇦🇪 AE`) |
-| 📞 Code | Filter phones by country code (`+91`, `+1`, `+44` …) |
-| 📧 Domain | Filter emails by domain + optional sort-by-domain |
-| 💳🔑📱 Type | Include only Cards / Emails / Phones / All |
+---
 
-### 📊 Output
-- **TXT** — cleaned, optionally sectioned by type
-- **CSV** — with Brand / Country / Code / Domain columns
-- **Excel (.xlsx)** — real workbook with a Summary sheet and one sheet per type
+## Filters
 
-### 👥 Extras
-- Per-user stats (files, lines, cards, combos) in SQLite
-- Global stats + Top 5 (owner only)
-- `/broadcast` to all users (owner only)
-- `/queue` history
-- Health endpoint (`/health`) for hosting
-- Auto-watermark on every TXT output
+| Filter | Applies to |
+|--------|------------|
+| 💳 Brand | Cards — brand from BIN (Visa, Mastercard, Amex, Discover, JCB, UnionPay, Diners, Maestro) |
+| 🌍 Country | All types — from the country tag at line end (`… — 🇦🇪 AE`) |
+| 📞 Code | Phones — country calling code (`+91`, `+1`, `+44` …) |
+| 🌐 Protocol | Proxies — `http` / `socks4` / `socks5` |
+| 🔌 Port | Proxies — by port number |
+| 💰 Network | Crypto — `BTC` / `ETH` |
+| 📧 Domain | Emails + URLs — by domain, plus optional sort-by-domain |
+| Type | Include only Cards / Emails / Phones / Proxies / URLs / Crypto / All |
+
+Filter buttons are **cycle buttons** — tap to move through the options and back
+to "All".
+
+## Cleaning
+
+- Auto-removes junk (bare `t.me/` links, `tg://` links, telegram headers,
+  `#` comments, blank lines)
+- **Deduplication** across every type (case-insensitive for emails)
+
+## Output
+
+- **TXT** — cleaned, sectioned by type
+- **CSV** — per-type columns (Brand, Country, Code, Protocol, Port, Network, Domain…)
+- **Excel (.xlsx)** — real workbook with a Summary sheet + one sheet per type
+
+## Upload limit
+
+**20 MB** maximum (Telegram's bot download limit). Bigger files are rejected
+with a clear message.
 
 ---
 
@@ -59,32 +75,23 @@ ways. Built as a cybersecurity-team school project.
 
    For a hosted setup you can also set `WEBHOOK_URL` and `PORT`.
 
-3. Send the bot any `.txt` file (see `sample.txt` for the format), then tap the
-   buttons to filter and export.
+3. Send the bot any `.txt` file, then tap the buttons to filter and export.
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome + instructions |
-| `📊 My Stats` | Your totals (files, lines, cards, combos) |
+| `📊 My Stats` | Your totals (files, lines, cards, combos, proxies, urls, crypto) |
 | `/stats` | Global stats (owner only) |
 | `/broadcast <msg>` | Message all users (owner only) |
 | `/queue` | Recent processing history |
 
 ---
 
-## Input format examples
+## Owner
 
-```
-4111111111111111|05|33|496 — 🇦🇪 AE      (card + country tag)
-5555555555554444 11 30 123              (card, space separated)
-alice@gmail.com:Tr0ub4dor&3             (email combo)
-+919876543210:India#2026                (phone combo)
-```
-
-The country tag at the end is optional — if present it powers the 🌍 Country
-filter, and the `+`-prefixed number powers the 📞 Code filter.
+👑 **Owner:** [https://t.me/yorichiiprime](https://t.me/yorichiiprime)
 
 ---
 
@@ -92,10 +99,8 @@ filter, and the `+`-prefixed number powers the 📞 Code filter.
 
 ```
 main.py          Telegram bot (parse → clean → filter → export)
-sample.txt       Fake/test data for demos
+sample.txt       Fake/test data covering every supported type
 requirements.txt
 ```
 
----
-
-*— @yorifederation*
+*— Yori Prime*
