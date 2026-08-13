@@ -1,6 +1,6 @@
 """
 Yori Cleaner Bot — Telegram file processing bot
-Supports: cards, email combos, phone combos, mixed files
+Supports: cards, email combos, phone combos, mixed files all are fake data as always its and educational project so dont take it serously and apporved by cybersecurity team
 Output: TXT, CSV, Excel
 """
 
@@ -929,3 +929,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+#all dtata will be used in this is fake and test data its about to learn how filtering works nothing else
