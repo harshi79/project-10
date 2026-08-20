@@ -438,6 +438,7 @@ def analyse_file(content: str) -> dict:
         1 for l in content.splitlines()
         if l.strip() and not l.lstrip().startswith("#")
     )
+    removed_links = []   # collect t.me links removed from output
 
     for raw in content.splitlines():
         r = analyse_line(raw)
@@ -494,6 +495,11 @@ def analyse_file(content: str) -> dict:
 
         elif kind == "url":
             _, url, host, country = r
+            # Remove t.me / https://t.me links from output
+            if "t.me/" in url or "https://t.me/" in url:
+                removed_links.append(url)
+                skipped += 1
+                continue
             if url in seen["urls"]:
                 skipped += 1
                 continue
@@ -508,7 +514,7 @@ def analyse_file(content: str) -> dict:
             seen["cryptos"].add(addr)
             buckets["cryptos"].append({"address": addr, "network": net, "country": country})
 
-    return {**buckets, "skipped": skipped, "total": total_nonempty}
+    return {**buckets, "skipped": skipped, "total": total_nonempty, "removed_links": removed_links}
 
 
 # ── Filter helpers ──────────────────────────────────────────────────────────────
@@ -747,11 +753,11 @@ def type_ikb(cards, combos, phones, proxies, urls, cryptos, uid: int, fmt: str =
     rows = []
     sel = selected_types or set()
 
-    # Row 1: Format
+    # Row 1: Format buttons (success style)
     rows.append([
-        InlineKeyboardButton(f"📄 TXT {'✅' if fmt == 'txt' else ''}", callback_data=f"fmt:txt:{uid}"),
-        InlineKeyboardButton(f"📊 CSV {'✅' if fmt == 'csv' else ''}", callback_data=f"fmt:csv:{uid}"),
-        InlineKeyboardButton(f"📈 Excel {'✅' if fmt == 'xlsx' else ''}", callback_data=f"fmt:xlsx:{uid}"),
+        InlineKeyboardButton(f"📄 TXT {'✅' if fmt == 'txt' else ''}", callback_data=f"fmt:txt:{uid}", style="success"),
+        InlineKeyboardButton(f"📊 CSV {'✅' if fmt == 'csv' else ''}", callback_data=f"fmt:csv:{uid}", style="success"),
+        InlineKeyboardButton(f"📈 Excel {'✅' if fmt == 'xlsx' else ''}", callback_data=f"fmt:xlsx:{uid}", style="success"),
     ])
 
     # Row 2: Type selection
@@ -809,7 +815,13 @@ def type_ikb(cards, combos, phones, proxies, urls, cryptos, uid: int, fmt: str =
             f"🔤 Sort by domain {'✅' if sort else ''}",
             callback_data=f"sels:domain:{uid}")])
 
-    rows.append([InlineKeyboardButton("🚀 GENERATE", callback_data=f"gen:{fmt}:{uid}")])
+    # Row 5: Generate (primary) and Skip (danger) buttons
+    rows.append([
+        InlineKeyboardButton("🚀 GENERATE", callback_data=f"gen:{fmt}:{uid}", style="primary"),
+        InlineKeyboardButton("⏭️ Skip", callback_data=f"skip:{uid}", style="danger"),
+    ])
+
+    # Row 6: Owner button
     rows.append([OWNER_BUTTON])
 
     return InlineKeyboardMarkup(rows)
@@ -1045,8 +1057,20 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         cards, combos, phones = result["cards"], result["combos"], result["phones"]
         proxies, urls, cryptos = result["proxies"], result["urls"], result["cryptos"]
         skipped, total = result["skipped"], result["total"]
+        removed_links = result.get("removed_links", [])
 
         await thinking.delete()
+
+        # If there are removed links, send them in a separate message
+        if removed_links:
+            link_list = "\n".join(f"• {link}" for link in removed_links[:20])  # limit to 20 to avoid spam
+            if len(removed_links) > 20:
+                link_list += f"\n… and {len(removed_links)-20} more."
+            await update.message.reply_text(
+                f"🚫 <b>Removed t.me links from output:</b>\n\n{link_list}\n\n"
+                f"These links were excluded from the final file.",
+                parse_mode="HTML",
+            )
 
         if not any([cards, combos, phones, proxies, urls, cryptos]):
             await update.message.reply_text(
@@ -1432,6 +1456,32 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             with queue_lock:
                 if item in file_queue:
                     file_queue.remove(item)
+
+    elif data.startswith("skip:"):
+        # Skip the current file for this user
+        item = _get_user_queue_item(uid)
+        if not item:
+            await query.answer("⏳ No pending file.", show_alert=True)
+            return
+
+        with queue_lock:
+            if item in file_queue:
+                file_queue.remove(item)
+
+        # Delete the message with the keyboard (or edit to show skipped)
+        try:
+            await query.message.delete()
+        except BadRequest:
+            pass
+        await ctx.bot.send_message(
+            uid,
+            f"⏭️ <b>File skipped.</b>\n"
+            f"📁 <code>{item['filename']}</code> has been discarded.\n"
+            f"You can send a new file anytime.",
+            parse_mode="HTML",
+            reply_markup=MAIN_KB,
+        )
+        await query.answer("✅ Skipped")
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
