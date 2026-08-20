@@ -587,6 +587,20 @@ def next_choice(current, options: list):
     return seq[(i + 1) % len(seq)]
 
 
+# ── Helper for buttons with fallback for older library versions ──────────────
+
+def _make_button(text, callback_data=None, url=None, style=None):
+    """Create InlineKeyboardButton with style if supported, else fallback."""
+    try:
+        if style:
+            return InlineKeyboardButton(text, callback_data=callback_data, url=url, style=style)
+        else:
+            return InlineKeyboardButton(text, callback_data=callback_data, url=url)
+    except TypeError:
+        # style parameter not accepted by this version → retry without it
+        return InlineKeyboardButton(text, callback_data=callback_data, url=url)
+
+
 # ── Output Builders ─────────────────────────────────────────────────────────────
 
 def proxy_str(p: dict) -> str:
@@ -733,7 +747,7 @@ def build_xlsx(cards, combos, phones, proxies, urls, cryptos) -> bytes:
 
 # ── Keyboards ───────────────────────────────────────────────────────────────────
 
-OWNER_BUTTON = InlineKeyboardButton("👑 Owner", url=BRAND_URL)
+OWNER_BUTTON = _make_button("👑 Owner", url=BRAND_URL)
 
 MAIN_KB = ReplyKeyboardMarkup(
     [["📊 My Stats", "ℹ️ Help"], ["🏷️ About"]],
@@ -753,11 +767,11 @@ def type_ikb(cards, combos, phones, proxies, urls, cryptos, uid: int, fmt: str =
     rows = []
     sel = selected_types or set()
 
-    # Row 1: Format buttons (success style)
+    # Row 1: Format buttons (success style if supported)
     rows.append([
-        InlineKeyboardButton(f"📄 TXT {'✅' if fmt == 'txt' else ''}", callback_data=f"fmt:txt:{uid}", style="success"),
-        InlineKeyboardButton(f"📊 CSV {'✅' if fmt == 'csv' else ''}", callback_data=f"fmt:csv:{uid}", style="success"),
-        InlineKeyboardButton(f"📈 Excel {'✅' if fmt == 'xlsx' else ''}", callback_data=f"fmt:xlsx:{uid}", style="success"),
+        _make_button(f"📄 TXT {'✅' if fmt == 'txt' else ''}", callback_data=f"fmt:txt:{uid}", style="success"),
+        _make_button(f"📊 CSV {'✅' if fmt == 'csv' else ''}", callback_data=f"fmt:csv:{uid}", style="success"),
+        _make_button(f"📈 Excel {'✅' if fmt == 'xlsx' else ''}", callback_data=f"fmt:xlsx:{uid}", style="success"),
     ])
 
     # Row 2: Type selection
@@ -773,10 +787,10 @@ def type_ikb(cards, combos, phones, proxies, urls, cryptos, uid: int, fmt: str =
         present = bool({"cards": cards, "combos": combos, "phones": phones,
                         "proxies": proxies, "urls": urls, "cryptos": cryptos}[key])
         if present:
-            type_row.append(InlineKeyboardButton(
+            type_row.append(_make_button(
                 f"{label} {'✅' if key in sel else ''}", callback_data=cb))
     if len(type_row) > 1:
-        type_row.append(InlineKeyboardButton(
+        type_row.append(_make_button(
             f"🔀 All {'✅' if not sel else ''}", callback_data=f"sel:all:{uid}"))
     if type_row:
         rows.extend(_chunk(type_row))
@@ -784,22 +798,22 @@ def type_ikb(cards, combos, phones, proxies, urls, cryptos, uid: int, fmt: str =
     # Row 3: Advanced filters (cycle buttons)
     filter_row = []
     if cards:
-        filter_row.append(InlineKeyboardButton(
+        filter_row.append(_make_button(
             f"💳 Brand: {brand or 'All'}", callback_data=f"brand:{uid}"))
     countries = get_available_countries(cards, combos, phones, proxies, urls, cryptos)
     if countries:
-        filter_row.append(InlineKeyboardButton(
+        filter_row.append(_make_button(
             f"🌍 Country: {country or 'All'}", callback_data=f"cty:{uid}"))
     if phones:
-        filter_row.append(InlineKeyboardButton(
+        filter_row.append(_make_button(
             f"📞 Code: {code or 'All'}", callback_data=f"code:{uid}"))
     if proxies:
-        filter_row.append(InlineKeyboardButton(
+        filter_row.append(_make_button(
             f"🌐 Protocol: {protocol or 'All'}", callback_data=f"proto:{uid}"))
-        filter_row.append(InlineKeyboardButton(
+        filter_row.append(_make_button(
             f"🔌 Port: {port or 'All'}", callback_data=f"port:{uid}"))
     if cryptos:
-        filter_row.append(InlineKeyboardButton(
+        filter_row.append(_make_button(
             f"💰 Network: {network or 'All'}", callback_data=f"net:{uid}"))
     if filter_row:
         rows.extend(_chunk(filter_row))
@@ -808,17 +822,17 @@ def type_ikb(cards, combos, phones, proxies, urls, cryptos, uid: int, fmt: str =
     if combos or urls:
         domains = get_domains(combos, urls)[:5]
         if domains:
-            rows.append([InlineKeyboardButton(
+            rows.append([_make_button(
                 f"📧 {d} {'✅' if domain == d else ''}",
                 callback_data=f"seld:{d}:{uid}") for d in domains])
-        rows.append([InlineKeyboardButton(
+        rows.append([_make_button(
             f"🔤 Sort by domain {'✅' if sort else ''}",
             callback_data=f"sels:domain:{uid}")])
 
     # Row 5: Generate (primary) and Skip (danger) buttons
     rows.append([
-        InlineKeyboardButton("🚀 GENERATE", callback_data=f"gen:{fmt}:{uid}", style="primary"),
-        InlineKeyboardButton("⏭️ Skip", callback_data=f"skip:{uid}", style="danger"),
+        _make_button("🚀 GENERATE", callback_data=f"gen:{fmt}:{uid}", style="primary"),
+        _make_button("⏭️ Skip", callback_data=f"skip:{uid}", style="danger"),
     ])
 
     # Row 6: Owner button
@@ -829,11 +843,11 @@ def type_ikb(cards, combos, phones, proxies, urls, cryptos, uid: int, fmt: str =
 
 def result_ikb(uid: int) -> InlineKeyboardMarkup:
     rows = [[
-        InlineKeyboardButton("📊 My Stats", callback_data=f"stats:{uid}"),
-        InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+        _make_button("📊 My Stats", callback_data=f"stats:{uid}"),
+        _make_button("ℹ️ Help", callback_data="help"),
     ]]
     if uid == OWNER_ID:
-        rows.append([InlineKeyboardButton("👑 Global Stats", callback_data="owner:stats")])
+        rows.append([_make_button("👑 Global Stats", callback_data="owner:stats")])
     rows.append([OWNER_BUTTON])
     return InlineKeyboardMarkup(rows)
 
@@ -1126,14 +1140,15 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=type_ikb(cards, combos, phones, proxies, urls, cryptos, uid, "txt"),
         )
 
-    except Exception:
+    except Exception as e:
         log.exception("handle_document error")
         try:
             await thinking.delete()
         except Exception:
             pass
         await update.message.reply_text(
-            "❌ <b>Something went wrong.</b> Please try again.",
+            f"❌ <b>Something went wrong.</b> Please try again.\n\n"
+            f"Error: {str(e)}",
             parse_mode="HTML", reply_markup=MAIN_KB,
         )
 
